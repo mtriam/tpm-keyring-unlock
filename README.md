@@ -98,10 +98,13 @@ If `/dev/tpmrm0` is group-writable but your user is not in that actual device
 group, `doctor` prints the owner/group, your groups, and this kind of fix:
 
 ```bash
-sudo usermod -aG <actual-device-group> $USER
+sudo usermod -aG <actual-device-group> <your-username>
 ```
 
-Then log out and log back in. The tool never runs that command for you.
+It uses the device's actual group, not a hardcoded group name. Then fully log
+out of the graphical session and log back in, or reboot. Opening a new shell is
+not enough for group membership changes. The tool never runs that command for
+you.
 
 ## Systemd
 

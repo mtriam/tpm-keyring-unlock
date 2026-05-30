@@ -279,11 +279,7 @@ func status(cfg config) error {
 	} else {
 		fmt.Println("metadata: unavailable:", err)
 	}
-	if err := checkStatePermissions(cfg); err != nil {
-		fmt.Println("permissions: bad:", err)
-	} else {
-		fmt.Println("permissions: ok")
-	}
+	printStatePermissionsCheck(cfg)
 	locked, err := collectionLocked(cfg.collection)
 	if err != nil {
 		fmt.Println("collection locked: unknown:", err)
@@ -355,8 +351,8 @@ func doctor(cfg config) error {
 		_, err := exec.LookPath(c)
 		fmt.Printf("%-20s %v\n", c, err == nil)
 	}
-	if st, err := os.Stat("/dev/tpmrm0"); err == nil {
-		fmt.Printf("/dev/tpmrm0          mode=%s\n", st.Mode())
+	if line, err := tpmDeviceSummary(); err == nil {
+		fmt.Println(line)
 	} else {
 		fmt.Println("/dev/tpmrm0          missing:", err)
 	}
@@ -373,11 +369,7 @@ func doctor(cfg config) error {
 	} else {
 		fmt.Printf("%-24s ok locked=%v\n", "collection locked property", locked)
 	}
-	if err := checkStatePermissions(cfg); err != nil {
-		printCheck("state permissions", err)
-	} else {
-		printCheck("state permissions", nil)
-	}
+	printStatePermissionsCheck(cfg)
 	return nil
 }
 
@@ -615,6 +607,22 @@ func printTPMPermissionAdvice() {
 	fmt.Println(advice)
 }
 
+func tpmDeviceSummary() (string, error) {
+	info, err := os.Stat("/dev/tpmrm0")
+	if err != nil {
+		return "", err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Sprintf("/dev/tpmrm0          mode=%s", info.Mode()), nil
+	}
+	uid := strconv.FormatUint(uint64(stat.Uid), 10)
+	gid := strconv.FormatUint(uint64(stat.Gid), 10)
+	owner := fallback(lookupUsername(uid), uid)
+	group := fallback(lookupGroupName(gid), gid)
+	return fmt.Sprintf("/dev/tpmrm0          mode=%s owner=%s(%s) group=%s(%s)", info.Mode(), owner, uid, group, gid), nil
+}
+
 func tpmPermissionAdvice() (string, bool) {
 	info, err := os.Stat("/dev/tpmrm0")
 	if err != nil {
@@ -648,6 +656,10 @@ func tpmPermissionAdvice() (string, bool) {
 	if stringInSlice(deviceGID, groupIDs) {
 		return "", false
 	}
+	username := current.Username
+	if username == "" {
+		username = "$USER"
+	}
 
 	var b strings.Builder
 	fmt.Fprintln(&b, "TPM permission hint:")
@@ -657,9 +669,12 @@ func tpmPermissionAdvice() (string, bool) {
 	fmt.Fprintf(&b, "  your groups:       %s\n", userGroupSummary(groupIDs))
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "The TPM resource manager is group-writable, but your user is not in that group.")
-	fmt.Fprintln(&b, "Suggested fix:")
-	fmt.Fprintf(&b, "  sudo usermod -aG %s $USER\n", groupForCommand)
-	fmt.Fprintln(&b, "  then log out and log back in")
+	fmt.Fprintln(&b, "Run this exact command:")
+	fmt.Fprintf(&b, "  sudo usermod -aG %s %s\n", shellQuote(groupForCommand), shellQuote(username))
+	fmt.Fprintln(&b)
+	fmt.Fprintf(&b, "Use the device group shown above (%s), not your hostname or username.\n", groupForCommand)
+	fmt.Fprintln(&b, "Then fully log out of the graphical session and log back in, or reboot.")
+	fmt.Fprintln(&b, "Starting a new shell with 'exec fish' (or any shell) is not enough for group membership changes.")
 	return strings.TrimRight(b.String(), "\n"), true
 }
 
@@ -719,9 +734,29 @@ func printCheck(name string, err error) {
 	fmt.Printf("%-24s ok\n", name)
 }
 
+func printStatePermissionsCheck(cfg config) {
+	if _, err := os.Stat(cfg.dir); errors.Is(err, os.ErrNotExist) {
+		fmt.Printf("%-24s ok (not enrolled yet)\n", "state permissions")
+		return
+	}
+	printCheck("state permissions", checkStatePermissions(cfg))
+}
+
 func quoteSystemdArg(arg string) string {
 	escaped := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(arg)
 	return `"` + escaped + `"`
+}
+
+func shellQuote(arg string) string {
+	if arg == "" {
+		return "''"
+	}
+	if strings.IndexFunc(arg, func(r rune) bool {
+		return !(r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.')
+	}) == -1 {
+		return arg
+	}
+	return "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
 }
 
 func runCmd(stdin io.Reader, name string, args ...string) error {
