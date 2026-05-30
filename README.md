@@ -147,6 +147,38 @@ that are normally available through an unlocked GNOME Keyring.
 This tool improves usability for passwordless login setups. It does not provide
 stronger protection than a locked user session.
 
+## TPM Notes
+
+The sealed object is created under the TPM owner hierarchy:
+
+```text
+tpm2_createprimary -C o
+```
+
+This is the ordinary choice for user-owned sealed objects on a local machine:
+the tool does not need endorsement keys, platform authorization, or LUKS slot
+changes.
+
+The default PCR policy is `sha256:7`, matching Secure Boot state. That is
+intentionally less fragile than sealing to PCRs that change across normal kernel
+or initramfs updates.
+
+Some machines may have custom TPM hierarchy policies or restricted owner
+hierarchy access. In that case `doctor` should show the TPM access failure, and
+you may need to adapt the hierarchy/policy for that system.
+
+## GNOME Keyring Note
+
+This tool uses GNOME Keyring's private DBus method:
+
+```text
+org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface.UnlockWithMasterPassword
+```
+
+That is the largest compatibility risk. It is used because the public
+`gnome-keyring-daemon --unlock` path can target the wrong `login` alias on
+systems where the real default collection has a different object path.
+
 ## Release Build
 
 The GitHub workflow publishes static Linux binaries for:
