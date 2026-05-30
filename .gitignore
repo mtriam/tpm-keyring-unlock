@@ -1,0 +1,4 @@
+/.cache/
+/.repo-git/
+/tpm-keyring-unlock
+/tpm-keyring-unlock.sha256
