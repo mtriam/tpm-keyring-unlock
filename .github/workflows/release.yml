@@ -10,8 +10,14 @@ permissions:
   contents: read
 
 jobs:
-  linux-amd64:
+  linux:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch:
+          - amd64
+          - arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,16 +30,16 @@ jobs:
 
       - name: Build
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags="-s -w" -o tpm-keyring-unlock .
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} go build -buildvcs=false -trimpath -ldflags="-s -w" -o tpm-keyring-unlock-linux-${{ matrix.goarch }} .
 
       - name: Checksum
         run: |
-          sha256sum tpm-keyring-unlock > tpm-keyring-unlock.sha256
+          sha256sum tpm-keyring-unlock-linux-${{ matrix.goarch }} > tpm-keyring-unlock-linux-${{ matrix.goarch }}.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tpm-keyring-unlock-linux-amd64
+          name: tpm-keyring-unlock-linux-${{ matrix.goarch }}
           path: |
-            tpm-keyring-unlock
-            tpm-keyring-unlock.sha256
+            tpm-keyring-unlock-linux-${{ matrix.goarch }}
+            tpm-keyring-unlock-linux-${{ matrix.goarch }}.sha256

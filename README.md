@@ -1,7 +1,12 @@
 # tpm-keyring-unlock
 
+Unlock GNOME Keyring using a TPM2-sealed secret.
+
 Small local-only CLI that unlocks the real GNOME Keyring default collection
 after passwordless login, using a TPM2-sealed keyring master password.
+
+Useful when PAM cannot provide your login password to `gnome-keyring`, such as
+fingerprint login, face unlock, FIDO2 login, or autologin.
 
 It is built for this shape:
 
@@ -115,12 +120,40 @@ tpm-keyring-unlock unlock
 `uninstall` stops and disables the user service, removes the unit file, and runs
 `systemctl --user daemon-reload`.
 
-`purge` removes the sealed state files. It does not uninstall the service.
+`purge` removes the sealed state files. It does not uninstall the service, and
+it does not modify GNOME Keyring contents or passwords.
+
+## Security Model
+
+This tool stores the GNOME Keyring master password only as a TPM2-sealed object.
+
+The password is not stored in plaintext on disk.
+
+The password is not passed via:
+
+- argv
+- environment variables
+- shell history
+- systemd unit files
+
+If TPM unseal succeeds, the keyring is unlocked automatically.
+
+This means that any process running as the logged-in user may access secrets
+that are normally available through an unlocked GNOME Keyring.
+
+This tool improves usability for passwordless login setups. It does not provide
+stronger protection than a locked user session.
 
 ## Release Build
 
-The GitHub workflow builds a Linux amd64 static binary and publishes a SHA256
-checksum artifact. The local equivalent is:
+The GitHub workflow publishes static Linux binaries for:
+
+- linux-amd64
+- linux-arm64
+
+along with SHA256 checksums.
+
+The local equivalent is:
 
 ```bash
 CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags="-s -w" -o tpm-keyring-unlock .
