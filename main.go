@@ -62,7 +62,7 @@ type secretValue struct {
 
 func main() {
 	if err := run(os.Args); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
+		fmt.Fprintln(os.Stderr, colorize("error:", colorRed), err)
 		os.Exit(1)
 	}
 }
@@ -124,7 +124,7 @@ Usage:
   %[1]s purge
   %[1]s doctor
 
-`, appName)
+`, colorize(appName, colorBold))
 }
 
 func defaultConfig() (config, error) {
@@ -180,7 +180,7 @@ func enroll(cfg config) error {
 		return errors.New("empty keyring password refused")
 	}
 
-	fmt.Println("verifying password against the real default collection...")
+	fmt.Println(colorize("verifying password against the real default collection...", colorDim))
 	if err := unlockCollection(cfg.collection, secret); err != nil {
 		return fmt.Errorf("password did not unlock collection: %w", err)
 	}
@@ -210,7 +210,7 @@ func enroll(cfg config) error {
 	if err := checkStatePermissions(cfg); err != nil {
 		return err
 	}
-	fmt.Println("self-testing sealed secret...")
+	fmt.Println(colorize("self-testing sealed secret...", colorDim))
 	selfTestSecret, err := unsealSecret(cfg)
 	if err != nil {
 		cleanupEnrollment(cfg)
@@ -221,7 +221,7 @@ func enroll(cfg config) error {
 		cleanupEnrollment(cfg)
 		return errors.New("enroll self-test failed: unsealed secret mismatch")
 	}
-	fmt.Println("enrolled sealed secret in", cfg.dir)
+	fmt.Println(colorize("enrolled sealed secret in", colorGreen), cfg.dir)
 	return nil
 }
 
@@ -238,7 +238,7 @@ func unlock(cfg config) error {
 		return err
 	}
 	if !locked {
-		fmt.Println("collection already unlocked")
+		fmt.Println(colorize("collection already unlocked", colorGreen))
 		return nil
 	}
 
@@ -263,7 +263,7 @@ func unlock(cfg config) error {
 	if locked {
 		return errors.New("unlock method returned success but collection remains locked")
 	}
-	fmt.Println("collection unlocked")
+	fmt.Println(colorize("collection unlocked", colorGreen))
 	return nil
 }
 
@@ -308,7 +308,7 @@ WantedBy=default.target
 	if err := os.WriteFile(cfg.systemdPath, []byte(unit), 0644); err != nil {
 		return err
 	}
-	fmt.Println("installed", cfg.systemdPath)
+	fmt.Println(colorize("installed", colorGreen), cfg.systemdPath)
 	_ = runCmd(nil, "systemctl", "--user", "daemon-reload")
 	_ = runCmd(nil, "systemctl", "--user", "enable", serviceName)
 	return nil
@@ -321,7 +321,7 @@ func uninstall(cfg config) error {
 		return err
 	}
 	_ = runCmd(nil, "systemctl", "--user", "daemon-reload")
-	fmt.Println("uninstalled", cfg.systemdPath)
+	fmt.Println(colorize("uninstalled", colorGreen), cfg.systemdPath)
 	return nil
 }
 
@@ -329,7 +329,7 @@ func purge(cfg config) error {
 	if err := removeEnrollment(cfg); err != nil {
 		return err
 	}
-	fmt.Println("purged sealed state from", cfg.dir)
+	fmt.Println(colorize("purged sealed state from", colorYellow), cfg.dir)
 	return nil
 }
 
@@ -347,14 +347,17 @@ func removeEnrollment(cfg config) error {
 }
 
 func doctor(cfg config) error {
+	fmt.Println(colorize("Tooling", colorBold))
 	for _, c := range []string{"tpm2_getcap", "tpm2_pcrread", "tpm2_createprimary", "tpm2_create", "tpm2_load", "tpm2_unseal", "systemctl"} {
 		_, err := exec.LookPath(c)
-		fmt.Printf("%-20s %v\n", c, err == nil)
+		printBool(c, err == nil)
 	}
+	fmt.Println()
+	fmt.Println(colorize("TPM", colorBold))
 	if line, err := tpmDeviceSummary(); err == nil {
 		fmt.Println(line)
 	} else {
-		fmt.Println("/dev/tpmrm0          missing:", err)
+		fmt.Println("/dev/tpmrm0          " + colorize("missing", colorRed) + ": " + err.Error())
 	}
 	if out, err := exec.Command("id").Output(); err == nil {
 		fmt.Print(strings.TrimSpace(string(out)), "\n")
@@ -362,13 +365,17 @@ func doctor(cfg config) error {
 	printCheck("tpm properties", runDiagnosticCmd("tpm2_getcap", "properties-fixed"))
 	printCheck("tpm pcr7", runDiagnosticCmd("tpm2_pcrread", cfg.pcrs))
 	printTPMPermissionAdvice()
+	fmt.Println()
+	fmt.Println(colorize("DBus", colorBold))
 	printCheck("session bus", checkSessionBus())
 	printCheck("secret service", checkSecretServiceName())
 	if locked, err := collectionLocked(cfg.collection); err != nil {
 		printCheck("collection locked property", err)
 	} else {
-		fmt.Printf("%-24s ok locked=%v\n", "collection locked property", locked)
+		fmt.Printf("%-24s %s locked=%v\n", "collection locked property", colorize("ok", colorGreen), locked)
 	}
+	fmt.Println()
+	fmt.Println(colorize("State", colorBold))
 	printStatePermissionsCheck(cfg)
 	return nil
 }
@@ -662,15 +669,15 @@ func tpmPermissionAdvice() (string, bool) {
 	}
 
 	var b strings.Builder
-	fmt.Fprintln(&b, "TPM permission hint:")
+	fmt.Fprintln(&b, colorize("TPM permission hint:", colorYellow))
 	fmt.Fprintf(&b, "  /dev/tpmrm0 owner: %s (%s)\n", fallback(ownerName, deviceUID), deviceUID)
 	fmt.Fprintf(&b, "  /dev/tpmrm0 group: %s (%s)\n", fallback(groupName, deviceGID), deviceGID)
 	fmt.Fprintf(&b, "  /dev/tpmrm0 mode:  %s\n", info.Mode())
 	fmt.Fprintf(&b, "  your groups:       %s\n", userGroupSummary(groupIDs))
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "The TPM resource manager is group-writable, but your user is not in that group.")
-	fmt.Fprintln(&b, "Run this exact command:")
-	fmt.Fprintf(&b, "  sudo usermod -aG %s %s\n", shellQuote(groupForCommand), shellQuote(username))
+	fmt.Fprintln(&b, colorize("Run this exact command:", colorYellow))
+	fmt.Fprintf(&b, "  %s\n", colorize(fmt.Sprintf("sudo usermod -aG %s %s", shellQuote(groupForCommand), shellQuote(username)), colorCyan))
 	fmt.Fprintln(&b)
 	fmt.Fprintf(&b, "Use the device group shown above (%s), not your hostname or username.\n", groupForCommand)
 	fmt.Fprintln(&b, "Then fully log out of the graphical session and log back in, or reboot.")
@@ -728,18 +735,54 @@ func fallback(value, fallback string) string {
 
 func printCheck(name string, err error) {
 	if err != nil {
-		fmt.Printf("%-24s fail: %v\n", name, err)
+		fmt.Printf("%-24s %s: %v\n", name, colorize("fail", colorRed), err)
 		return
 	}
-	fmt.Printf("%-24s ok\n", name)
+	fmt.Printf("%-24s %s\n", name, colorize("ok", colorGreen))
+}
+
+func printBool(name string, ok bool) {
+	value := colorize("true", colorGreen)
+	if !ok {
+		value = colorize("false", colorRed)
+	}
+	fmt.Printf("%-20s %s\n", name, value)
 }
 
 func printStatePermissionsCheck(cfg config) {
 	if _, err := os.Stat(cfg.dir); errors.Is(err, os.ErrNotExist) {
-		fmt.Printf("%-24s ok (not enrolled yet)\n", "state permissions")
+		fmt.Printf("%-24s %s %s\n", "state permissions", colorize("ok", colorGreen), colorize("(not enrolled yet)", colorDim))
 		return
 	}
 	printCheck("state permissions", checkStatePermissions(cfg))
+}
+
+const (
+	colorReset  = "\x1b[0m"
+	colorBold   = "\x1b[1m"
+	colorDim    = "\x1b[2m"
+	colorRed    = "\x1b[31m"
+	colorGreen  = "\x1b[32m"
+	colorYellow = "\x1b[33m"
+	colorCyan   = "\x1b[36m"
+)
+
+func colorize(s, color string) string {
+	if !colorsEnabled() {
+		return s
+	}
+	return color + s + colorReset
+}
+
+func colorsEnabled() bool {
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+		return false
+	}
+	info, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 func quoteSystemdArg(arg string) string {
