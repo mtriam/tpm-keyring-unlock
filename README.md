@@ -1,5 +1,9 @@
 # tpm-keyring-unlock
 
+Fork of a deleted project that restores the original TPM-based GNOME Keyring unlocking tool.
+
+Original source: https://github.com/Tunahanyrd/tpm-keyring-unlock/tree/main#
+
 Unlock GNOME Keyring using a TPM2-sealed secret.
 
 Small local-only CLI that unlocks the real GNOME Keyring default collection
