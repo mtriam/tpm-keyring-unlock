@@ -24,11 +24,10 @@ import (
 )
 
 const (
-	appName        = "tpm-keyring-unlock"
-	serviceName    = "tpm-keyring-unlock.service"
-	collectionPath = "/org/freedesktop/secrets/collection/Default_5fkeyring"
-	retryTimeout   = 30 * time.Second
-	retryInterval  = 500 * time.Millisecond
+	appName       = "tpm-keyring-unlock"
+	serviceName   = "tpm-keyring-unlock.service"
+	retryTimeout  = 30 * time.Second
+	retryInterval = 500 * time.Millisecond
 )
 
 type config struct {
@@ -89,6 +88,12 @@ func run(args []string) error {
 	if err := fs.Parse(args[2:]); err != nil {
 		return err
 	}
+	if cfg.collection == "" {
+		cfg.collection, err = readDefaultCollection()
+		if err != nil {
+			return err
+		}
+	}
 	cfg.refreshPaths()
 
 	switch args[1] {
@@ -139,13 +144,34 @@ func defaultConfig() (config, error) {
 	cfg := config{
 		dir:         filepath.Join(home, ".local", "share", appName),
 		pcrs:        "sha256:7",
-		collection:  collectionPath,
 		timeout:     retryTimeout,
 		installPath: exe,
 		systemdPath: filepath.Join(home, ".config", "systemd", "user", serviceName),
 	}
 	cfg.refreshPaths()
 	return cfg, nil
+}
+
+func readDefaultCollection() (string, error) {
+	conn, err := dbus.SessionBus()
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+
+	obj := conn.Object("org.freedesktop.secrets", dbus.ObjectPath("/org/freedesktop/secrets"))
+	var collection dbus.ObjectPath
+	if err := obj.Call(
+		"org.freedesktop.Secret.Service.ReadAlias",
+		0,
+		"default",
+	).Store(&collection); err != nil {
+		return "", fmt.Errorf("ReadAlias default failed: %w", err)
+	}
+	if collection == "" || collection == "/" {
+		return "", errors.New("ReadAlias default returned an empty collection path")
+	}
+	return string(collection), nil
 }
 
 func (c *config) refreshPaths() {
@@ -156,7 +182,7 @@ func (c *config) refreshPaths() {
 }
 
 func enroll(cfg config) error {
-	if err := requireCommands("tpm2_createprimary", "tpm2_create"); err != nil {
+	if err := requireCommands("tpm2_createprimary", "tpm2_create", "tpm2_startauthsession", "tpm2_policypcr", "tpm2_flushcontext"); err != nil {
 		return err
 	}
 	if err := checkTPMReady(); err != nil {
@@ -194,9 +220,32 @@ func enroll(cfg config) error {
 	if err := runCmd(nil, "tpm2_createprimary", "-C", "o", "-G", "ecc", "-c", primaryCtx); err != nil {
 		return err
 	}
-	if err := runCmd(bytes.NewReader(secret), "tpm2_create", "-C", primaryCtx, "-u", cfg.sealedPub, "-r", cfg.sealedPriv, "-i", "-", "-l", cfg.pcrs); err != nil {
+
+	// Compute the PCR policy digest that will gate this object's USER auth role.
+	policyDigest := filepath.Join(tmp, "policy.digest")
+	sessionCtx := filepath.Join(tmp, "trial.ctx")
+	if err := runCmd(nil, "tpm2_startauthsession", "-S", sessionCtx, "-g", "sha256"); err != nil {
 		return err
 	}
+	if err := runCmd(nil, "tpm2_policypcr", "-S", sessionCtx, "-l", cfg.pcrs, "-L", policyDigest); err != nil {
+		_ = runCmd(nil, "tpm2_flushcontext", sessionCtx)
+		return err
+	}
+	if err := runCmd(nil, "tpm2_flushcontext", sessionCtx); err != nil {
+		return err
+	}
+
+	// No userwithauth: unsealing is only possible by satisfying the PCR policy above.
+	if err := runCmd(bytes.NewReader(secret), "tpm2_create",
+		"-C", primaryCtx,
+		"-u", cfg.sealedPub, "-r", cfg.sealedPriv,
+		"-i", "-",
+		"-L", policyDigest,
+		"-a", "fixedtpm|fixedparent|adminwithpolicy",
+	); err != nil {
+		return err
+	}
+
 	sum := sha256.Sum256(secret)
 	secretHash := hex.EncodeToString(sum[:])
 	if err := os.WriteFile(cfg.secretHash, []byte(secretHash+"\n"), 0600); err != nil {
@@ -395,6 +444,16 @@ func verifyHash(cfg config, secret []byte) error {
 }
 
 func unsealSecret(cfg config) ([]byte, error) {
+	if err := requireCommands(
+		"tpm2_createprimary",
+		"tpm2_load",
+		"tpm2_startauthsession",
+		"tpm2_policypcr",
+		"tpm2_flushcontext",
+		"tpm2_unseal",
+	); err != nil {
+		return nil, err
+	}
 	tmp, err := os.MkdirTemp("", appName+"-")
 	if err != nil {
 		return nil, err
@@ -408,8 +467,21 @@ func unsealSecret(cfg config) ([]byte, error) {
 	if err := runCmd(nil, "tpm2_load", "-C", primaryCtx, "-u", cfg.sealedPub, "-r", cfg.sealedPriv, "-c", keyCtx); err != nil {
 		return nil, err
 	}
+
+	// Rebuild the same PCR policy session used at enroll time; without a
+	// matching PCR state this session will not satisfy the object's policy
+	// and tpm2_unseal below will fail.
+	sessionCtx := filepath.Join(tmp, "session.ctx")
+	if err := runCmd(nil, "tpm2_startauthsession", "--policy-session", "-S", sessionCtx, "-g", "sha256"); err != nil {
+		return nil, err
+	}
+	defer runCmd(nil, "tpm2_flushcontext", sessionCtx)
+	if err := runCmd(nil, "tpm2_policypcr", "-S", sessionCtx, "-l", cfg.pcrs); err != nil {
+		return nil, err
+	}
+
 	var out bytes.Buffer
-	if err := runCmdOut(&out, nil, "tpm2_unseal", "-c", keyCtx); err != nil {
+	if err := runCmdOut(&out, nil, "tpm2_unseal", "-c", keyCtx, "-p", "session:"+sessionCtx); err != nil {
 		return nil, err
 	}
 	secret := append([]byte(nil), out.Bytes()...)

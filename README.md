@@ -1,12 +1,21 @@
 # tpm-keyring-unlock
 
+Fork of a deleted project that restores the original TPM-based GNOME Keyring unlocking tool.
+
+Original source: https://github.com/Tunahanyrd/tpm-keyring-unlock/tree/main#
+
 Unlock GNOME Keyring using a TPM2-sealed secret.
 
 Small local-only CLI that unlocks the real GNOME Keyring default collection
 after passwordless login, using a TPM2-sealed keyring master password.
 
+The tool resolves the live default Secret Service collection automatically via
+`org.freedesktop.Secret.Service.ReadAlias("default")`, and can still be
+overridden with `--collection` when you need to target a non-default alias.
+
 Useful when PAM cannot provide your login password to `gnome-keyring`, such as
 fingerprint login, face unlock, FIDO2 login, or autologin.
+
 
 It is built for this shape:
 
@@ -68,6 +77,11 @@ Useful options:
 --collection /org/freedesktop/secrets/collection/Default_5fkeyring
 --state-dir ~/.local/share/tpm-keyring-unlock
 ```
+
+If `--collection` is omitted, the tool reads the active default Secret Service
+alias at runtime and uses that exact object path. This avoids assuming a fixed
+GNOME Keyring naming pattern on systems where the default collection has a
+non-standard object path.
 
 ## What It Stores
 
@@ -158,6 +172,20 @@ tpm2_createprimary -C o
 This is the ordinary choice for user-owned sealed objects on a local machine:
 the tool does not need endorsement keys, platform authorization, or LUKS slot
 changes.
+
+The object is created with a PCR policy digest and the `adminwithpolicy`/fixed
+TPM/fixed parent attributes, so it can only be unsealed when the same PCR state
+is present. The flow uses:
+
+```text
+tpm2_startauthsession
+ tpm2_policypcr
+ tpm2_flushcontext
+ tpm2_create -L <policyDigest> -a fixedtpm|fixedparent|adminwithpolicy
+```
+
+This intentionally removes the normal `userwithauth` path; the secret is
+available only when the session satisfies the recorded PCR policy.
 
 The default PCR policy is `sha256:7`, matching Secure Boot state. That is
 intentionally less fragile than sealing to PCRs that change across normal kernel
