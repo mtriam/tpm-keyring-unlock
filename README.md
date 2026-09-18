@@ -9,9 +9,11 @@ Unlock GNOME Keyring using a TPM2-sealed secret.
 Small local-only CLI that unlocks the real GNOME Keyring default collection
 after passwordless login, using a TPM2-sealed keyring master password.
 
-The tool resolves the live default Secret Service collection automatically via
-`org.freedesktop.Secret.Service.ReadAlias("default")`, and can still be
-overridden with `--collection` when you need to target a non-default alias.
+During enrollment, the tool resolves the live default Secret Service
+collection via `org.freedesktop.Secret.Service.ReadAlias("default")`, and can
+still be overridden with `--collection` when you need to target a non-default
+alias. The selected collection and PCR policy are stored in `metadata.json`
+and reused by later `unlock` calls.
 
 Useful when PAM cannot provide your login password to `gnome-keyring`, such as
 fingerprint login, face unlock, FIDO2 login, or autologin.
@@ -88,11 +90,12 @@ non-standard object path.
 ```text
 ~/.local/share/tpm-keyring-unlock/keyring.pub
 ~/.local/share/tpm-keyring-unlock/keyring.priv
-~/.local/share/tpm-keyring-unlock/secret.sha256
 ~/.local/share/tpm-keyring-unlock/metadata.json
 ```
 
-`secret.sha256` is only an integrity check. It cannot unlock the keyring.
+`metadata.json` records the collection object path and PCR selection captured
+during enrollment. `unlock` uses those values instead of resolving the current
+`default` alias or taking PCR settings from its command line.
 
 `enroll` immediately self-tests the sealed object by unsealing it again. If the
 self-test fails, generated state files are removed.
@@ -137,8 +140,10 @@ tpm-keyring-unlock unlock
 `uninstall` stops and disables the user service, removes the unit file, and runs
 `systemctl --user daemon-reload`.
 
-`purge` removes the sealed state files. It does not uninstall the service, and
-it does not modify GNOME Keyring contents or passwords.
+`purge` removes the sealed state files only. It does not stop or disable the
+user service, remove its unit file, or modify GNOME Keyring contents or
+passwords. Run `uninstall` separately when the systemd user service should be
+removed.
 
 ## Security Model
 

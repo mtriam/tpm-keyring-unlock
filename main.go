@@ -3,8 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -39,17 +37,15 @@ type config struct {
 	systemdPath string
 	sealedPub   string
 	sealedPriv  string
-	secretHash  string
 	metadata    string
 }
 
 type metadata struct {
-	Version      int       `json:"version"`
-	App          string    `json:"app"`
-	CreatedAt    time.Time `json:"created_at"`
-	Collection   string    `json:"collection"`
-	PCRs         string    `json:"pcrs"`
-	SecretSHA256 string    `json:"secret_sha256"`
+	Version    int       `json:"version"`
+	App        string    `json:"app"`
+	CreatedAt  time.Time `json:"created_at"`
+	Collection string    `json:"collection"`
+	PCRs       string    `json:"pcrs"`
 }
 
 type secretValue struct {
@@ -88,7 +84,7 @@ func run(args []string) error {
 	if err := fs.Parse(args[2:]); err != nil {
 		return err
 	}
-	if cfg.collection == "" {
+	if cfg.collection == "" && args[1] != "unlock" && args[1] != "purge" && args[1] != "uninstall" {
 		cfg.collection, err = readDefaultCollection()
 		if err != nil {
 			return err
@@ -152,8 +148,16 @@ func defaultConfig() (config, error) {
 	return cfg, nil
 }
 
+// dbusConn opens a PRIVATE session bus connection. Unlike dbus.SessionBus(),
+// which returns a process-wide shared/cached connection that must never be
+// closed by callers, a private connection is safe for each call site to
+// open and Close() independently.
+func dbusConn() (*dbus.Conn, error) {
+	return dbus.ConnectSessionBus()
+}
+
 func readDefaultCollection() (string, error) {
-	conn, err := dbus.SessionBus()
+	conn, err := dbusConn()
 	if err != nil {
 		return "", err
 	}
@@ -177,7 +181,6 @@ func readDefaultCollection() (string, error) {
 func (c *config) refreshPaths() {
 	c.sealedPub = filepath.Join(c.dir, "keyring.pub")
 	c.sealedPriv = filepath.Join(c.dir, "keyring.priv")
-	c.secretHash = filepath.Join(c.dir, "secret.sha256")
 	c.metadata = filepath.Join(c.dir, "metadata.json")
 }
 
@@ -246,14 +249,9 @@ func enroll(cfg config) error {
 		return err
 	}
 
-	sum := sha256.Sum256(secret)
-	secretHash := hex.EncodeToString(sum[:])
-	if err := os.WriteFile(cfg.secretHash, []byte(secretHash+"\n"), 0600); err != nil {
-		return err
-	}
 	_ = os.Chmod(cfg.sealedPub, 0600)
 	_ = os.Chmod(cfg.sealedPriv, 0600)
-	if err := writeMetadata(cfg, secretHash); err != nil {
+	if err := writeMetadata(cfg); err != nil {
 		return err
 	}
 	if err := checkStatePermissions(cfg); err != nil {
@@ -281,6 +279,12 @@ func unlock(cfg config) error {
 	if missingAny(cfg.sealedPub, cfg.sealedPriv) {
 		return errors.New("not enrolled; run enroll first")
 	}
+	md, err := enrollmentMetadata(cfg)
+	if err != nil {
+		return fmt.Errorf("read enrollment metadata: %w", err)
+	}
+	cfg.collection = md.Collection
+	cfg.pcrs = md.PCRs
 
 	locked, err := collectionLockedWithRetry(cfg.collection, cfg.timeout)
 	if err != nil {
@@ -299,9 +303,6 @@ func unlock(cfg config) error {
 		return err
 	}
 	defer zero(secret)
-	if err := verifyHash(cfg, secret); err != nil {
-		return err
-	}
 	if err := unlockCollectionWithRetry(cfg.collection, secret, cfg.timeout); err != nil {
 		return err
 	}
@@ -318,22 +319,25 @@ func unlock(cfg config) error {
 
 func status(cfg config) error {
 	fmt.Println("state dir:", cfg.dir)
-	fmt.Println("collection:", cfg.collection)
-	fmt.Println("pcrs:", cfg.pcrs)
 	fmt.Println("enrolled:", !missingAny(cfg.sealedPub, cfg.sealedPriv))
-	if md, err := readMetadata(cfg); err == nil {
-		fmt.Println("metadata pcrs:", md.PCRs)
-		fmt.Println("metadata collection:", md.Collection)
+	md, err := enrollmentMetadata(cfg)
+	if err == nil {
+		fmt.Println("enrolled collection:", md.Collection)
+		fmt.Println("enrolled PCRs:", md.PCRs)
 		fmt.Println("metadata created:", md.CreatedAt.Format(time.RFC3339))
+		printStatePermissionsCheck(cfg)
+		locked, err := collectionLocked(md.Collection)
+		if err != nil {
+			fmt.Println("collection locked: unknown:", err)
+		} else {
+			fmt.Println("collection locked:", locked)
+		}
 	} else {
+		fmt.Println("enrolled collection: unavailable")
+		fmt.Println("enrolled PCRs: unavailable")
 		fmt.Println("metadata: unavailable:", err)
-	}
-	printStatePermissionsCheck(cfg)
-	locked, err := collectionLocked(cfg.collection)
-	if err != nil {
-		fmt.Println("collection locked: unknown:", err)
-	} else {
-		fmt.Println("collection locked:", locked)
+		printStatePermissionsCheck(cfg)
+		fmt.Println("collection locked: unknown (enrollment metadata missing or invalid)")
 	}
 	_, err = os.Stat(cfg.systemdPath)
 	fmt.Println("systemd user service installed:", err == nil)
@@ -344,32 +348,52 @@ func install(cfg config) error {
 	if err := os.MkdirAll(filepath.Dir(cfg.systemdPath), 0755); err != nil {
 		return err
 	}
+	args := strings.Join([]string{
+		quoteSystemdArg(cfg.installPath),
+		"unlock",
+		"--state-dir", quoteSystemdArg(cfg.dir),
+		"--timeout", quoteSystemdArg(cfg.timeout.String()),
+	}, " ")
 	unit := fmt.Sprintf(`[Unit]
 Description=Unlock GNOME keyring default collection using TPM2 sealed secret
 
 [Service]
 Type=oneshot
-ExecStart=%s unlock
+ExecStart=%s
 
 [Install]
 WantedBy=default.target
-`, quoteSystemdArg(cfg.installPath))
+`, args)
 	if err := os.WriteFile(cfg.systemdPath, []byte(unit), 0644); err != nil {
 		return err
 	}
+	if err := runCmd(nil, "systemctl", "--user", "daemon-reload"); err != nil {
+		return err
+	}
+	if err := runCmd(nil, "systemctl", "--user", "enable", serviceName); err != nil {
+		return err
+	}
 	fmt.Println(colorize("installed", colorGreen), cfg.systemdPath)
-	_ = runCmd(nil, "systemctl", "--user", "daemon-reload")
-	_ = runCmd(nil, "systemctl", "--user", "enable", serviceName)
 	return nil
 }
 
 func uninstall(cfg config) error {
-	_ = runCmd(nil, "systemctl", "--user", "stop", serviceName)
-	_ = runCmd(nil, "systemctl", "--user", "disable", serviceName)
+	if _, err := os.Stat(cfg.systemdPath); err == nil {
+		if err := runCmd(nil, "systemctl", "--user", "stop", serviceName); err != nil {
+			return err
+		}
+		if err := runCmd(nil, "systemctl", "--user", "disable", serviceName); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	if err := os.Remove(cfg.systemdPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	_ = runCmd(nil, "systemctl", "--user", "daemon-reload")
+	if err := runCmd(nil, "systemctl", "--user", "daemon-reload"); err != nil {
+		return err
+	}
 	fmt.Println(colorize("uninstalled", colorGreen), cfg.systemdPath)
 	return nil
 }
@@ -387,7 +411,7 @@ func cleanupEnrollment(cfg config) {
 }
 
 func removeEnrollment(cfg config) error {
-	for _, path := range []string{cfg.sealedPub, cfg.sealedPriv, cfg.secretHash, cfg.metadata} {
+	for _, path := range []string{cfg.sealedPub, cfg.sealedPriv, filepath.Join(cfg.dir, "secret.sha256"), cfg.metadata} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -426,20 +450,6 @@ func doctor(cfg config) error {
 	fmt.Println()
 	fmt.Println(colorize("State", colorBold))
 	printStatePermissionsCheck(cfg)
-	return nil
-}
-
-func verifyHash(cfg config, secret []byte) error {
-	wantBytes, err := os.ReadFile(cfg.secretHash)
-	if err != nil {
-		return nil
-	}
-	sum := sha256.Sum256(secret)
-	got := hex.EncodeToString(sum[:])
-	want := strings.TrimSpace(string(wantBytes))
-	if want != "" && got != want {
-		return errors.New("unsealed secret hash mismatch")
-	}
 	return nil
 }
 
@@ -488,14 +498,13 @@ func unsealSecret(cfg config) ([]byte, error) {
 	return secret, nil
 }
 
-func writeMetadata(cfg config, secretHash string) error {
+func writeMetadata(cfg config) error {
 	md := metadata{
-		Version:      1,
-		App:          appName,
-		CreatedAt:    time.Now().UTC(),
-		Collection:   cfg.collection,
-		PCRs:         cfg.pcrs,
-		SecretSHA256: secretHash,
+		Version:    2,
+		App:        appName,
+		CreatedAt:  time.Now().UTC(),
+		Collection: cfg.collection,
+		PCRs:       cfg.pcrs,
 	}
 	data, err := json.MarshalIndent(md, "", "  ")
 	if err != nil {
@@ -520,12 +529,29 @@ func readMetadata(cfg config) (metadata, error) {
 	return md, nil
 }
 
+func enrollmentMetadata(cfg config) (metadata, error) {
+	md, err := readMetadata(cfg)
+	if err != nil {
+		return metadata{}, fmt.Errorf("metadata unreadable: %w", err)
+	}
+	if md.App != appName {
+		return metadata{}, fmt.Errorf("metadata app mismatch: got %q, want %q", md.App, appName)
+	}
+	if md.Collection == "" {
+		return metadata{}, errors.New("metadata missing collection")
+	}
+	if md.PCRs == "" {
+		return metadata{}, errors.New("metadata missing PCRs")
+	}
+	return md, nil
+}
+
 func checkStatePermissions(cfg config) error {
 	if err := checkPathPerm(cfg.dir, 0700); err != nil {
 		return err
 	}
-	for _, path := range []string{cfg.sealedPub, cfg.sealedPriv, cfg.secretHash, cfg.metadata} {
-		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+	for _, path := range []string{cfg.sealedPub, cfg.sealedPriv, cfg.metadata} {
+		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
 			continue
 		}
 		if err := checkPathPerm(path, 0600); err != nil {
@@ -536,9 +562,12 @@ func checkStatePermissions(cfg config) error {
 }
 
 func checkPathPerm(path string, want os.FileMode) error {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s must not be a symlink", path)
 	}
 	got := info.Mode().Perm()
 	if got != want {
@@ -548,7 +577,7 @@ func checkPathPerm(path string, want os.FileMode) error {
 }
 
 func unlockCollection(collection string, secret []byte) error {
-	conn, err := dbus.SessionBus()
+	conn, err := dbusConn()
 	if err != nil {
 		return err
 	}
@@ -565,6 +594,10 @@ func unlockCollection(collection string, secret []byte) error {
 	).Store(&output, &session); err != nil {
 		return fmt.Errorf("OpenSession failed: %w", err)
 	}
+	defer func() {
+		sessionObj := conn.Object("org.freedesktop.secrets", session)
+		_ = sessionObj.Call("org.freedesktop.Secret.Session.Close", 0).Err
+	}()
 
 	dbusSecret := secretValue{
 		Session:     session,
@@ -590,7 +623,7 @@ func unlockCollectionWithRetry(collection string, secret []byte, timeout time.Du
 }
 
 func collectionLocked(collection string) (bool, error) {
-	conn, err := dbus.SessionBus()
+	conn, err := dbusConn()
 	if err != nil {
 		return false, err
 	}
@@ -643,7 +676,7 @@ func withRetry(timeout time.Duration, fn func() error) error {
 }
 
 func checkSessionBus() error {
-	conn, err := dbus.SessionBus()
+	conn, err := dbusConn()
 	if err != nil {
 		return err
 	}
@@ -651,7 +684,7 @@ func checkSessionBus() error {
 }
 
 func checkSecretServiceName() error {
-	conn, err := dbus.SessionBus()
+	conn, err := dbusConn()
 	if err != nil {
 		return err
 	}
@@ -942,7 +975,11 @@ func readPassword() ([]byte, error) {
 	oldState, err := getTermios(fd)
 	if err != nil {
 		reader := bufio.NewReader(os.Stdin)
-		return reader.ReadBytes('\n')
+		line, readErr := reader.ReadBytes('\n')
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return nil, readErr
+		}
+		return bytes.TrimRight(line, "\r\n"), nil
 	}
 	newState := oldState
 	newState.Lflag &^= syscall.ECHO
