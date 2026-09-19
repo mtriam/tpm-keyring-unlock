@@ -218,9 +218,14 @@ Check the persistent TPM handles:
 
 If `0x81018043` is already in use, you have two options.
 
-Use a different persistent handle:
+Use a different persistent handle that is not currently present in
+`tpm2_getcap handles-persistent`, for example:
 
     ./tpm-keyring-unlock enroll --handle 0x81018044
+
+This creates a fresh enrollment in a free TPM persistent handle. Pick any
+unused handle in the valid persistent range (`0x81000000 .. 0x81ffffff`), not
+just the next number.
 
 Or, if the existing object belongs to this application, remove the enrollment
 first:
