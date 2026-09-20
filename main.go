@@ -1,3 +1,5 @@
+//go:build linux
+
 // tpm-keyring-unlock: TPM2 sealed GNOME keyring unlock helper.
 //
 // The keyring master password is sealed into a persistent TPM object whose
@@ -5,7 +7,8 @@
 // unlocks the default Secret Service collection.
 //
 // Threat model (see also "doctor"):
-//   - protects against offline disk theft and against a changed boot state;
+//   - protects against offline disk theft and against changes to the selected
+//     measured boot state;
 //   - does NOT protect against a process that can use /dev/tpmrm0 while the
 //     PCRs match, because the policy has no authValue/PIN.
 package main
@@ -31,9 +34,9 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-	"unsafe"
 
 	"github.com/godbus/dbus/v5"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -42,13 +45,17 @@ const (
 	retryTimeout           = 30 * time.Second
 	retryInterval          = 500 * time.Millisecond
 	defaultSealedHandle    = "0x81018043"
+	dynamicHandleFirst     = uint64(0x81018000)
+	dynamicHandleLast      = uint64(0x8101ffff)
 	metadataVersion        = 5
 	maxSealedSecretSize    = 128
 	maxPasswordInput       = 4096
 	unsealBufferSize       = 2048
 	maxDBusObjectPath      = 255
 	maxPCRIndex            = 23
+	maxMetadataSize        = 64 * 1024
 	externalCommandTimeout = 30 * time.Second
+	statusTimeout          = 3 * time.Second
 
 	// Errors that are neither classified as transient nor permanent are
 	// retried only this many times, so that e.g. a wrong password does not
@@ -95,12 +102,14 @@ var errInterrupted = errors.New("interrupted")
 type config struct {
 	dir            string
 	pcrs           string
+	pcrsExplicit   bool
 	collection     string
 	timeout        time.Duration
 	installPath    string
 	systemdPath    string
 	metadata       string
 	handle         string
+	handleExplicit bool
 	forgetMetadata bool
 }
 
@@ -159,7 +168,7 @@ func main() {
 	err := run(os.Args)
 
 	if err != nil {
-		fmt.Fprintln(os.Stderr, colorize("error:", colorRed), err)
+		fmt.Fprintln(os.Stderr, colorizeStderr("error:", colorRed), err)
 	}
 
 	switch {
@@ -267,6 +276,27 @@ func run(args []string) error {
 		)
 	}
 
+	timeoutExplicit := false
+
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "pcrs":
+			cfg.pcrsExplicit = true
+		case "handle":
+			cfg.handleExplicit = true
+		case "timeout":
+			timeoutExplicit = true
+		}
+	})
+
+	if err := validateCommandFlags(cmd, fs); err != nil {
+		return err
+	}
+
+	if cmd == "status" && !timeoutExplicit {
+		cfg.timeout = statusTimeout
+	}
+
 	cfg.refreshPaths()
 
 	switch cmd {
@@ -312,28 +342,59 @@ func run(args []string) error {
 }
 
 func usage() {
-	fmt.Printf(`%s: TPM2 sealed GNOME keyring unlock helper
+	fmt.Printf(`%[1]s: TPM2 sealed GNOME keyring unlock helper
 
 Usage:
-  %[1]s enroll    [-pcrs sha256:7] [-handle 0x81018043] [-collection PATH] [-timeout 30s] [-state-dir DIR]
-  %[1]s unlock    [-timeout 30s] [-state-dir DIR]
-  %[1]s status    [-state-dir DIR]
+  %[1]s enroll    [-pcrs sha256:7] [-handle %[2]s] [-collection PATH] [-timeout 30s] [-state-dir DIR]
+  %[1]s unlock    [-collection PATH] [-timeout 30s] [-state-dir DIR]
+  %[1]s status    [-timeout 3s] [-state-dir DIR]
   %[1]s install   [-install-path /absolute/path/to/binary] [-timeout 30s] [-state-dir DIR]
   %[1]s uninstall
-  %[1]s purge     [-forget-metadata] [-state-dir DIR]
+  %[1]s purge     [-handle 0xHANDLE] [-forget-metadata] [-state-dir DIR]
   %[1]s doctor    [-pcrs sha256:7] [-collection PATH] [-state-dir DIR]
 
 Enrollment is persistent-only. There is no sealed-file fallback.
+
+When -handle is omitted and the default handle %[2]s is occupied, enroll
+selects the first free handle in 0x81018000..0x8101FFFF. An explicitly
+supplied -handle is never replaced automatically.
 
 To replace an existing enrollment:
   %[1]s purge
   %[1]s enroll
 
+For purge, -handle is only used to check occupancy when enrollment metadata
+is absent; it never selects a different object for removal.
+
 If purge refuses because the local metadata is unreadable or invalid, and the
 TPM object is not needed (or is already gone):
   %[1]s purge -forget-metadata
 
-`, colorize(appName, colorBold))
+`, colorize(appName, colorBold), defaultSealedHandle)
+}
+
+func validateCommandFlags(cmd string, fs *flag.FlagSet) error {
+	allowed := map[string]map[string]bool{
+		"enroll":    {"state-dir": true, "pcrs": true, "collection": true, "timeout": true, "handle": true},
+		"unlock":    {"state-dir": true, "collection": true, "timeout": true},
+		"status":    {"state-dir": true, "timeout": true},
+		"install":   {"state-dir": true, "timeout": true, "install-path": true},
+		"uninstall": {},
+		"purge":     {"state-dir": true, "handle": true, "forget-metadata": true},
+		"doctor":    {"state-dir": true, "pcrs": true, "collection": true},
+	}
+
+	for _, flagName := range []string{"state-dir", "pcrs", "collection", "timeout", "handle", "install-path", "forget-metadata"} {
+		used := false
+		fs.Visit(func(f *flag.Flag) {
+			used = used || f.Name == flagName
+		})
+		if used && !allowed[cmd][flagName] {
+			return fmt.Errorf("flag -%s is not valid for %s", flagName, cmd)
+		}
+	}
+
+	return nil
 }
 
 func defaultConfig() (config, error) {
@@ -379,14 +440,7 @@ func (c *config) refreshPaths() {
 // core dumps and, together with the kernel's ptrace rules, reading the
 // secret out of the process memory by other same-UID processes.
 func hardenProcess() {
-	const prSetDumpable = 4
-
-	_, _, _ = syscall.Syscall(
-		syscall.SYS_PRCTL,
-		prSetDumpable,
-		0,
-		0,
-	)
+	_ = unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0)
 }
 
 var (
@@ -461,14 +515,20 @@ func sleepInterruptible(d time.Duration) error {
 	}
 }
 
-// newSecretBuf returns an empty buffer with the given capacity. The memory
-// is locked (best effort) so it is not written to swap.
+// newSecretBuf returns a buffer whose capacity is rounded to a page multiple.
+// The memory is locked (best effort) so it is not written to swap.
 func newSecretBuf(size int) []byte {
-	b := make([]byte, 0, size)
+	if size <= 0 {
+		return nil
+	}
 
-	_ = syscall.Mlock(b[:size])
+	pageSize := os.Getpagesize()
+	aligned := (size + pageSize - 1) &^ (pageSize - 1)
+	b := make([]byte, aligned)
 
-	return b
+	_ = unix.Mlock(b)
+
+	return b[:0]
 }
 
 // releaseSecretBuf zeroes the whole capacity of a buffer obtained from
@@ -482,7 +542,7 @@ func releaseSecretBuf(b []byte) {
 
 	zero(full)
 
-	_ = syscall.Munlock(full)
+	_ = unix.Munlock(full)
 }
 
 func zero(
@@ -534,16 +594,24 @@ func resolveTool(name string) (string, error) {
 	)
 }
 
-// childEnv returns the environment for external tools: PATH is replaced by
-// the trusted directories and dynamic-linker variables are dropped.
+// childEnv returns a minimal environment for external tools: PATH is replaced
+// by the trusted directories and loader / TPM wiring variables are dropped so
+// child commands consistently operate in a known environment.
 func childEnv() []string {
 	src := os.Environ()
 
 	env := make([]string, 0, len(src)+1)
 
 	for _, kv := range src {
-		if strings.HasPrefix(kv, "PATH=") ||
-			strings.HasPrefix(kv, "LD_") {
+		name, _, _ := strings.Cut(kv, "=")
+		switch {
+		case name == "PATH":
+			continue
+		case strings.HasPrefix(name, "LD_"):
+			continue
+		case strings.HasPrefix(name, "TPM2TOOLS_"):
+			continue
+		case strings.HasPrefix(name, "TSS2_"):
 			continue
 		}
 
@@ -704,6 +772,10 @@ func readDefaultCollection() (string, error) {
 	}
 
 	if err := validateDBusObjectPath(string(collection)); err != nil {
+		if collection == "/" {
+			err = markTransient(err)
+		}
+
 		return "",
 			fmt.Errorf(
 				"ReadAlias default returned invalid collection path %q: %w",
@@ -722,6 +794,23 @@ func readDefaultCollection() (string, error) {
 func resolveCollection(
 	explicit,
 	recorded string,
+	timeout time.Duration,
+) (string, error) {
+	return resolveCollectionWithRetry(
+		explicit,
+		recorded,
+		timeout,
+		collectionLocked,
+		readDefaultCollection,
+	)
+}
+
+func resolveCollectionWithRetry(
+	explicit,
+	recorded string,
+	timeout time.Duration,
+	collectionLockedFn func(string) (bool, error),
+	readDefaultFn func() (string, error),
 ) (string, error) {
 	if explicit != "" {
 		if err := validateDBusObjectPath(explicit); err != nil {
@@ -738,32 +827,63 @@ func resolveCollection(
 				err,
 			)
 		}
-
-		if _, err := collectionLocked(recorded); err == nil {
-			return recorded, nil
-		} else if !isMissingCollectionError(err) {
-			return "", fmt.Errorf(
-				"recorded collection %s is unavailable: %w",
-				recorded,
-				err,
-			)
-		}
 	}
 
-	collection, err := readDefaultCollection()
+	var selected string
+
+	err := withRetry(
+		timeout,
+		func() error {
+			if recorded != "" {
+				if _, err := collectionLockedFn(recorded); err == nil {
+					selected = recorded
+					return nil
+				} else {
+					err = classifyDBusError(err)
+					if !isMissingCollectionError(err) {
+						if isTransient(err) {
+							return err
+						}
+
+						return fmt.Errorf(
+							"recorded collection %s is unavailable: %w",
+							recorded,
+							err,
+						)
+					}
+				}
+			}
+
+			collection, err := readDefaultFn()
+			if err != nil {
+				return err
+			}
+
+			if _, err := collectionLockedFn(collection); err == nil {
+				selected = collection
+				return nil
+			} else {
+				err = classifyDBusError(err)
+				if !isMissingCollectionError(err) && !isTransient(err) {
+					return fmt.Errorf(
+						"default collection %s is unavailable: %w",
+						collection,
+						err,
+					)
+				}
+				return err
+			}
+		},
+	)
 	if err != nil {
 		return "", err
 	}
 
-	if _, err := collectionLocked(collection); err != nil {
-		return "", fmt.Errorf(
-			"default collection %s is unavailable: %w",
-			collection,
-			err,
-		)
+	if selected != "" {
+		return selected, nil
 	}
 
-	return collection, nil
+	return "", errors.New("no Secret Service collection available")
 }
 
 func isMissingCollectionError(err error) bool {
@@ -869,9 +989,38 @@ func enroll(cfg config) error {
 		return statErr
 	}
 
+	if available, err := persistentSlotsAvailable(); err == nil && available == 0 {
+		return errors.New("TPM has no persistent handle slots available")
+	}
+
 	// Validate the state directory BEFORE any TPM state is changed.
 	if err := ensureStateDir(cfg); err != nil {
 		return err
+	}
+
+	if !cfg.handleExplicit {
+		handles, err := persistentHandles()
+		if err != nil {
+			return fmt.Errorf(
+				"inspect persistent handles: %w",
+				err,
+			)
+		}
+
+		defaultValue, _ := strconv.ParseUint(defaultSealedHandle[2:], 16, 32)
+		if _, exists := handles[defaultValue]; exists {
+			cfg.handle, err = allocatePersistentHandle(handles)
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf(
+				"default persistent handle %s is occupied; using %s; the existing object's identity is unknown, inspect it with 'tpm2_readpublic -c %s'\n",
+				defaultSealedHandle,
+				cfg.handle,
+				defaultSealedHandle,
+			)
+		}
 	}
 
 	state, err := inspectPersistent(
@@ -1357,6 +1506,7 @@ func unlock(cfg config) error {
 	cfg.collection, err = resolveCollection(
 		cfg.collection,
 		md.Collection,
+		cfg.timeout,
 	)
 	if err != nil {
 		return fmt.Errorf(
@@ -1425,11 +1575,49 @@ func unlock(cfg config) error {
 	return nil
 }
 
+// statusCollectionState resolves the enrolled collection and reads its Locked
+// property with a hard upper bound. withRetry only checks its deadline between
+// attempts, so a single blocked D-Bus call could otherwise exceed the timeout.
+// The goroutine may outlive the timeout, which is harmless because status
+// returns right after and the process exits.
+func statusCollectionState(
+	recorded string,
+	timeout time.Duration,
+) (bool, error) {
+	limit := timeout
+	if limit <= 0 {
+		limit = statusTimeout
+	}
+
+	type result struct {
+		locked bool
+		err    error
+	}
+
+	done := make(chan result, 1)
+
+	go func() {
+		collection, err := resolveCollection("", recorded, timeout)
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+
+		locked, err := collectionLocked(collection)
+		done <- result{locked: locked, err: err}
+	}()
+
+	select {
+	case r := <-done:
+		return r.locked, r.err
+
+	case <-time.After(limit + retryInterval):
+		return false, fmt.Errorf("timed out after %s", limit)
+	}
+}
+
 func status(cfg config) error {
-	fmt.Println(
-		"state dir:",
-		cfg.dir,
-	)
+	fmt.Println("state dir:", cfg.dir)
 
 	statePermissionsErr := checkExistingStatePermissions(cfg)
 	if statePermissionsErr != nil {
@@ -1447,140 +1635,57 @@ func status(cfg config) error {
 
 	md, err := enrollmentMetadata(cfg)
 	if err != nil {
-		fmt.Println(
-			"enrolled: false",
-		)
-		fmt.Println(
-			"metadata: unavailable:",
-			err,
-		)
+		fmt.Println("enrolled: false")
+		fmt.Println("metadata: unavailable:", err)
 
 		printCheck("state permissions", statePermissionsErr)
 
-		_, statErr := os.Stat(
-			cfg.systemdPath,
-		)
+		_, statErr := os.Stat(cfg.systemdPath)
+		fmt.Println("systemd user service installed:", statErr == nil)
 
-		fmt.Println(
-			"systemd user service installed:",
-			statErr == nil,
-		)
-
-		if !errors.Is(err, os.ErrNotExist) && statusErr == nil {
+		if !errors.Is(err, os.ErrNotExist) {
 			statusErr = err
 		}
 
 		return statusErr
 	}
 
-	fmt.Println(
-		"enrolled: true",
-	)
+	fmt.Println("enrolled: true")
+	fmt.Println("enrolled collection:", md.Collection)
+	fmt.Println("enrolled PCRs:", md.PCRs)
+	fmt.Println("metadata version:", md.Version)
+	fmt.Println("metadata created:", md.CreatedAt.Format(time.RFC3339))
+	fmt.Println("persistent sealed object:", md.Handle)
 
-	fmt.Println(
-		"enrolled collection:",
-		md.Collection,
-	)
-
-	fmt.Println(
-		"enrolled PCRs:",
-		md.PCRs,
-	)
-
-	fmt.Println(
-		"metadata version:",
-		md.Version,
-	)
-
-	fmt.Println(
-		"metadata created:",
-		md.CreatedAt.Format(time.RFC3339),
-	)
-
-	fmt.Println(
-		"persistent sealed object:",
-		md.Handle,
-	)
-
-	state, inspectErr := inspectPersistent(
-		md.Handle,
-		md.HandleName,
-	)
-
+	state, inspectErr := inspectPersistent(md.Handle, md.HandleName)
 	if inspectErr != nil {
-		fmt.Printf(
-			"persistent object state: unknown: %v\n",
-			inspectErr,
-		)
-		if statusErr == nil {
-			statusErr = errors.New("persistent object could not be verified")
-		}
+		fmt.Printf("persistent object state: unknown: %v\n", inspectErr)
+		statusErr = errors.New("persistent object could not be verified")
 	} else {
-		fmt.Println(
-			"persistent object state:",
-			state,
-		)
+		fmt.Println("persistent object state:", state)
 
-		if state != handleOurs && statusErr == nil {
-			statusErr = fmt.Errorf(
-				"persistent object state is %s",
-				state,
-			)
+		if state != handleOurs {
+			statusErr = fmt.Errorf("persistent object state is %s", state)
 		}
 	}
 
 	if state == handleOurs {
-		currentName, nameErr := persistentObjectName(
-			md.Handle,
-		)
-
-		if nameErr == nil {
-			fmt.Println(
-				"persistent object Name:",
-				currentName,
-			)
+		if currentName, nameErr := persistentObjectName(md.Handle); nameErr == nil {
+			fmt.Println("persistent object Name:", currentName)
 		}
 	}
 
-	printCheck(
-		"state permissions",
-		statePermissionsErr,
-	)
+	printCheck("state permissions", statePermissionsErr)
 
-	collection, collectionErr := resolveCollection(
-		"",
-		md.Collection,
-	)
-	if collectionErr != nil {
-		fmt.Println(
-			"collection locked: unknown:",
-			collectionErr,
-		)
+	locked, lockedErr := statusCollectionState(md.Collection, cfg.timeout)
+	if lockedErr != nil {
+		fmt.Println("collection locked: unknown:", lockedErr)
 	} else {
-		locked, err := collectionLocked(
-			collection,
-		)
-		if err != nil {
-			fmt.Println(
-				"collection locked: unknown:",
-				err,
-			)
-		} else {
-			fmt.Println(
-				"collection locked:",
-				locked,
-			)
-		}
+		fmt.Println("collection locked:", locked)
 	}
 
-	_, err = os.Stat(
-		cfg.systemdPath,
-	)
-
-	fmt.Println(
-		"systemd user service installed:",
-		err == nil,
-	)
+	_, err = os.Stat(cfg.systemdPath)
+	fmt.Println("systemd user service installed:", err == nil)
 
 	return statusErr
 }
@@ -1675,6 +1780,10 @@ WantedBy=default.target
 		return err
 	}
 
+	if err := syncDir(filepath.Dir(cfg.systemdPath)); err != nil {
+		return err
+	}
+
 	if err := runCmd(
 		nil,
 		"systemctl",
@@ -1730,6 +1839,9 @@ func validateInstallPath(path string) error {
 		insideTemp = true
 	}
 
+	// This check must run before the parent directory check: /tmp is
+	// world-writable, and the temporary-build hint is far more useful than a
+	// generic permission error.
 	if insideTemp || strings.Contains(clean, "go-build") {
 		return fmt.Errorf(
 			"install path %q looks like a temporary build (for example 'go run'); "+
@@ -1772,6 +1884,74 @@ func validateInstallPath(path string) error {
 				uid,
 				os.Getuid(),
 			)
+		}
+	}
+
+	return validateInstallPathParents(clean)
+}
+
+// validateInstallDir checks a single directory on the path to the installed
+// binary: it must be a real directory (not a symlink), owned by root or the
+// current user, and not writable by group or others.
+func validateInstallDir(dir string, info os.FileInfo) error {
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("install path directory %q must not be a symlink", dir)
+	}
+
+	if !info.IsDir() {
+		return fmt.Errorf("install path directory %q is not a directory", dir)
+	}
+
+	if info.Mode().Perm()&0022 != 0 {
+		return fmt.Errorf(
+			"install path directory %q is writable by group or others (mode %04o); "+
+				"tighten it (for example: chmod go-w %s) or install the binary in a directory "+
+				"that only you and root can modify",
+			dir,
+			info.Mode().Perm(),
+			shellQuote(dir),
+		)
+	}
+
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		uid := uint64(stat.Uid)
+		if uid != 0 && uid != uint64(os.Getuid()) {
+			return fmt.Errorf(
+				"install path directory %q is owned by UID %d, want root or UID %d",
+				dir,
+				uid,
+				os.Getuid(),
+			)
+		}
+	}
+
+	return nil
+}
+
+// validateInstallPathParents verifies that every directory on the path to the
+// installed binary passes validateInstallDir, so another local user cannot
+// replace the binary through directory permissions after the unit has been
+// installed. The check runs only at install time.
+func validateInstallPathParents(path string) error {
+	current := string(filepath.Separator)
+
+	for _, component := range strings.Split(
+		strings.TrimPrefix(filepath.Dir(path), current),
+		string(filepath.Separator),
+	) {
+		if component == "" {
+			continue
+		}
+
+		current = filepath.Join(current, component)
+
+		info, err := os.Lstat(current)
+		if err != nil {
+			return fmt.Errorf("install path directory %q: %w", current, err)
+		}
+
+		if err := validateInstallDir(current, info); err != nil {
+			return err
 		}
 	}
 
@@ -1846,13 +2026,7 @@ func forgetHint() string {
 func purge(cfg config) error {
 	// Security boundary: never read or remove anything through a symlinked
 	// state directory or metadata file.
-	//
-	// This check must happen BEFORE readMetadata(). The previous implementation
-	// did it too late, which allowed:
-	//
-	//   link -> real-directory
-	//
-	// followed by removal of real-directory/metadata.json.
+	
 	if err := checkExistingStatePermissions(cfg); err != nil {
 		return fmt.Errorf(
 			"state permissions: %w",
@@ -1860,7 +2034,28 @@ func purge(cfg config) error {
 		)
 	}
 
+	if cfg.handleExplicit {
+		if err := validatePersistentHandle(cfg.handle); err != nil {
+			return fmt.Errorf(
+				"invalid -handle %q: %w",
+				cfg.handle,
+				err,
+			)
+		}
+	}
+
 	if cfg.forgetMetadata {
+		if cfg.handleExplicit {
+			if md, err := readMetadata(cfg); err == nil &&
+				!strings.EqualFold(md.Handle, cfg.handle) {
+				return fmt.Errorf(
+					"-handle %s does not match the enrolled handle %s; -handle is only for checking occupancy when metadata is absent",
+					cfg.handle,
+					md.Handle,
+				)
+			}
+		}
+
 		return forgetLocalState(cfg)
 	}
 
@@ -1876,6 +2071,14 @@ func purge(cfg config) error {
 				md.App,
 				appName,
 				forgetHint(),
+			)
+		}
+
+		if cfg.handleExplicit && !strings.EqualFold(cfg.handle, md.Handle) {
+			return fmt.Errorf(
+				"-handle %s does not match the enrolled handle %s; -handle is only for checking occupancy when metadata is absent",
+				cfg.handle,
+				md.Handle,
 			)
 		}
 
@@ -1965,10 +2168,19 @@ func purge(cfg config) error {
 		)
 	}
 
-	if err := removeEnrollment(
-		cfg,
-	); err != nil {
-		return err
+	removed, removeErr := removeEnrollment(cfg)
+	if removeErr != nil {
+		return removeErr
+	}
+
+	if removed == 0 {
+		fmt.Println(
+			colorize("no local enrollment state found in", colorDim),
+			cfg.dir,
+			"(TPM untouched)",
+		)
+
+		return nil
 	}
 
 	fmt.Println(
@@ -2001,15 +2213,26 @@ func forgetLocalState(cfg config) error {
 				os.Stderr,
 				"%s persistent handle %s is still occupied and was NOT touched; "+
 					"if it is yours, remove it manually: tpm2_evictcontrol -C o -c %s\n",
-				colorize("warning:", colorYellow),
+				colorizeStderr("warning:", colorYellow),
 				md.Handle,
 				md.Handle,
 			)
 		}
 	}
 
-	if err := removeEnrollment(cfg); err != nil {
+	removed, err := removeEnrollment(cfg)
+	if err != nil {
 		return err
+	}
+
+	if removed == 0 {
+		fmt.Println(
+			colorize("no local state files found in", colorDim),
+			cfg.dir,
+			"(TPM untouched)",
+		)
+
+		return nil
 	}
 
 	fmt.Println(
@@ -2024,59 +2247,122 @@ func warnIfHandleOccupied(
 	cfg config,
 	reason string,
 ) {
-	if err := validatePersistentHandle(cfg.handle); err != nil {
+	handles, err := persistentHandles()
+	if err != nil {
 		return
 	}
 
-	exists, err := persistentHandleExists(
-		cfg.handle,
-	)
-	if err != nil || !exists {
-		return
-	}
+	var candidates []uint64
 
-	fmt.Fprintf(
-		os.Stderr,
-		"%s %s, but persistent handle %[3]s is occupied. Its identity cannot be verified, "+
-			"so it was NOT touched. If it is an orphan from an interrupted enrollment, inspect it with "+
-			"'tpm2_readpublic -c %[3]s' and remove it with 'tpm2_evictcontrol -C o -c %[3]s'.\n",
-		colorize("warning:", colorYellow),
-		reason,
-		cfg.handle,
-	)
-}
+	if cfg.handleExplicit {
+		if validateErr := validatePersistentHandle(cfg.handle); validateErr != nil {
+			return
+		}
 
-func removeEnrollment(cfg config) error {
-	for _, path := range []string{
-		cfg.metadata,
-		filepath.Join(
-			cfg.dir,
-			"keyring.pub",
-		),
-		filepath.Join(
-			cfg.dir,
-			"keyring.priv",
-		),
-		filepath.Join(
-			cfg.dir,
-			"secret.sha256",
-		),
-	} {
-		if err := os.Remove(
-			path,
-		); err != nil &&
-			!errors.Is(
-				err,
-				os.ErrNotExist,
-			) {
-			return err
+		value, parseErr := strconv.ParseUint(cfg.handle[2:], 16, 32)
+		if parseErr != nil {
+			return
+		}
+
+		candidates = append(candidates, value)
+	} else {
+		defaultValue, _ := strconv.ParseUint(defaultSealedHandle[2:], 16, 32)
+
+		candidates = append(candidates, defaultValue)
+
+		for value := dynamicHandleFirst; value <= dynamicHandleLast; value++ {
+			candidates = append(candidates, value)
 		}
 	}
 
-	return nil
+	seen := make(map[uint64]struct{}, len(candidates))
+
+	for _, value := range candidates {
+		if _, alreadyReported := seen[value]; alreadyReported {
+			continue
+		}
+		seen[value] = struct{}{}
+
+		if _, occupied := handles[value]; !occupied {
+			continue
+		}
+
+		handle := fmt.Sprintf("0x%08x", value)
+
+		fmt.Fprintf(
+			os.Stderr,
+			"%s %s, but persistent handle %s is occupied. Its identity cannot be verified, "+
+				"so it was NOT touched. If it is an orphan from an interrupted enrollment, inspect it with "+
+				"'tpm2_readpublic -c %s' and remove it with 'tpm2_evictcontrol -C o -c %s'.\n",
+			colorizeStderr("warning:", colorYellow),
+			reason,
+			handle,
+			handle,
+			handle,
+		)
+	}
+}
+
+// removeEnrollment deletes the local enrollment files and returns how many
+// files were actually removed. Files that do not exist are not an error.
+func removeEnrollment(cfg config) (int, error) {
+	removed := 0
+
+	remove := func(path string) error {
+		err := os.Remove(path)
+		if err == nil {
+			removed++
+			return nil
+		}
+
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+
+		return err
+	}
+
+	for _, path := range []string{
+		cfg.metadata,
+		filepath.Join(cfg.dir, "keyring.pub"),
+		filepath.Join(cfg.dir, "keyring.priv"),
+		filepath.Join(cfg.dir, "secret.sha256"),
+	} {
+		if err := remove(path); err != nil {
+			return removed, err
+		}
+	}
+
+	entries, err := os.ReadDir(cfg.dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return removed, nil
+	}
+	if err != nil {
+		return removed, err
+	}
+
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), ".metadata.json.tmp-") {
+			continue
+		}
+
+		if err := remove(filepath.Join(cfg.dir, entry.Name())); err != nil {
+			return removed, err
+		}
+	}
+
+	return removed, nil
 }
 
 func doctor(cfg config) error {
+	if !cfg.pcrsExplicit {
+		if md, err := readMetadata(cfg); err == nil && md.PCRs != "" {
+			cfg.pcrs = md.PCRs
+		}
+	}
+
+	var failed bool
+
 	fmt.Println(
 		colorize("Tooling", colorBold),
 	)
@@ -2096,10 +2382,14 @@ func doctor(cfg config) error {
 		"systemctl",
 	} {
 		_, err := resolveTool(c)
+		ok := err == nil
 		printBool(
 			c,
-			err == nil,
+			ok,
 		)
+		if !ok {
+			failed = true
+		}
 	}
 
 	fmt.Println()
@@ -2133,27 +2423,50 @@ func doctor(cfg config) error {
 		)
 	}
 
-	printCheck(
-		"tpm properties",
-		runDiagnosticCmd(
-			"tpm2_getcap",
-			"properties-fixed",
-		),
-	)
+	if err := runDiagnosticCmd(
+		"tpm2_getcap",
+		"properties-fixed",
+	); err != nil {
+		printCheck("tpm properties", err)
+		failed = true
+	} else {
+		printCheck("tpm properties", nil)
+	}
+
+	if available, err := persistentSlotsAvailable(); err != nil {
+		printCheck("persistent TPM slots", err)
+		failed = true
+	} else if available == 0 {
+		printCheck(
+			"persistent TPM slots",
+			errors.New("TPM has no persistent handle slots available"),
+		)
+		failed = true
+	} else {
+		fmt.Printf(
+			"%-28s %s: %d available\n",
+			"persistent TPM slots",
+			colorize("ok", colorGreen),
+			available,
+		)
+	}
 
 	if err := validatePCRSelection(cfg.pcrs); err != nil {
 		printCheck(
 			"tpm pcr selection",
 			err,
 		)
+		failed = true
 	} else {
-		printCheck(
-			"tpm "+cfg.pcrs,
-			runDiagnosticCmd(
-				"tpm2_pcrread",
-				cfg.pcrs,
-			),
-		)
+		if err := runDiagnosticCmd(
+			"tpm2_pcrread",
+			cfg.pcrs,
+		); err != nil {
+			printCheck("tpm "+cfg.pcrs, err)
+			failed = true
+		} else {
+			printCheck("tpm "+cfg.pcrs, nil)
+		}
 	}
 
 	printTPMPermissionAdvice()
@@ -2163,15 +2476,38 @@ func doctor(cfg config) error {
 		colorize("DBus", colorBold),
 	)
 
-	printCheck(
-		"session bus",
-		checkSessionBus(),
-	)
+	sessionBusErr := checkSessionBus()
+	printCheck("session bus", sessionBusErr)
+	if sessionBusErr != nil {
+		failed = true
+	}
 
-	printCheck(
-		"secret service",
-		checkSecretServiceName(),
-	)
+	secretServiceErr := checkSecretServiceName()
+	if dbusErrorName(secretServiceErr) == "org.freedesktop.DBus.Error.NameHasNoOwner" {
+		activatable, activatableErr := checkSecretServiceActivatable()
+		switch {
+		case activatableErr != nil:
+			printCheck("secret service", activatableErr)
+			failed = true
+		case activatable:
+			fmt.Printf(
+				"%-28s %s: service is activatable but not running yet; it will be started on first access\n",
+				"secret service",
+				colorize("unknown", colorYellow),
+			)
+		default:
+			printCheck(
+				"secret service",
+				errors.New("service has no owner and is not activatable"),
+			)
+			failed = true
+		}
+	} else {
+		printCheck("secret service", secretServiceErr)
+		if secretServiceErr != nil {
+			failed = true
+		}
+	}
 
 	// The collection comes from -collection, then from metadata while the
 	// recorded object still exists, and finally from the current default alias.
@@ -2200,12 +2536,13 @@ func doctor(cfg config) error {
 				"recorded collection path",
 				err,
 			)
+			failed = true
 		} else if locked, err := collectionLocked(
 			recordedCollection,
 		); err == nil {
 			collection = recordedCollection
 			fmt.Printf(
-				"%-24s %s locked=%v\n",
+				"%-28s %s locked=%v\n",
 				"collection locked property",
 				colorize("ok", colorGreen),
 				locked,
@@ -2215,6 +2552,7 @@ func doctor(cfg config) error {
 				"recorded collection",
 				err,
 			)
+			failed = true
 		}
 	}
 
@@ -2225,6 +2563,9 @@ func doctor(cfg config) error {
 			"default collection alias",
 			err,
 		)
+		if err != nil {
+			failed = true
+		}
 
 		if err == nil {
 			collection = c
@@ -2239,9 +2580,10 @@ func doctor(cfg config) error {
 				"collection locked property",
 				err,
 			)
+			failed = true
 		} else {
 			fmt.Printf(
-				"%-24s %s locked=%v\n",
+				"%-28s %s locked=%v\n",
 				"collection locked property",
 				colorize("ok", colorGreen),
 				locked,
@@ -2251,20 +2593,20 @@ func doctor(cfg config) error {
 
 	if listed, err := privateUnlockInterfaceListed(); err != nil {
 		fmt.Printf(
-			"%-24s %s: %v\n",
+			"%-28s %s: %v\n",
 			"private unlock interface",
 			colorize("unknown", colorYellow),
 			err,
 		)
 	} else if listed {
 		fmt.Printf(
-			"%-24s %s\n",
+			"%-28s %s\n",
 			"private unlock interface",
 			colorize("listed", colorGreen),
 		)
 	} else {
 		fmt.Printf(
-			"%-24s %s\n",
+			"%-28s %s\n",
 			"private unlock interface",
 			colorize("not listed by introspection (informational; the call may still work)", colorYellow),
 		)
@@ -2276,6 +2618,9 @@ func doctor(cfg config) error {
 	)
 
 	printStatePermissionsCheck(cfg)
+	if statePermissionsErr != nil {
+		failed = true
+	}
 
 	fmt.Println()
 	fmt.Println(
@@ -2283,6 +2628,10 @@ func doctor(cfg config) error {
 	)
 
 	printSecurityNotes(cfg)
+
+	if failed {
+		return errors.New("doctor found one or more failed checks")
+	}
 
 	return nil
 }
@@ -2482,7 +2831,7 @@ func unsealPersistent(
 	}
 
 	backing := newSecretBuf(unsealBufferSize)
-	out := bytes.NewBuffer(backing)
+	out := bytes.NewBuffer(backing[:0])
 
 	if err := runCmdOut(
 		out,
@@ -2565,7 +2914,7 @@ func unsealLoaded(
 	}
 
 	backing := newSecretBuf(unsealBufferSize)
-	out := bytes.NewBuffer(backing)
+	out := bytes.NewBuffer(backing[:0])
 
 	if err := runCmdOut(
 		out,
@@ -2586,6 +2935,25 @@ func unsealLoaded(
 func persistentHandleExists(
 	handle string,
 ) (bool, error) {
+	if err := validatePersistentHandle(handle); err != nil {
+		return false, err
+	}
+
+	handles, err := persistentHandles()
+	if err != nil {
+		return false, err
+	}
+
+	value, err := strconv.ParseUint(handle[2:], 16, 32)
+	if err != nil {
+		return false, err
+	}
+
+	_, exists := handles[value]
+	return exists, nil
+}
+
+func persistentHandles() (map[uint64]struct{}, error) {
 	var out bytes.Buffer
 
 	if err := runCmdOut(
@@ -2594,20 +2962,74 @@ func persistentHandleExists(
 		"tpm2_getcap",
 		"handles-persistent",
 	); err != nil {
-		return false, err
+		return nil, err
 	}
 
-	want := strings.ToLower(handle)
+	handles := make(map[uint64]struct{})
+	for _, field := range strings.Fields(out.String()) {
+		if !handleRE.MatchString(field) {
+			continue
+		}
 
-	for _, field := range strings.Fields(
-		out.String(),
-	) {
-		if strings.ToLower(field) == want {
-			return true, nil
+		value, err := strconv.ParseUint(field[2:], 16, 32)
+		if err == nil {
+			handles[value] = struct{}{}
 		}
 	}
 
-	return false, nil
+	return handles, nil
+}
+
+func persistentSlotsAvailable() (uint64, error) {
+	var out bytes.Buffer
+
+	if err := runCmdOut(
+		&out,
+		nil,
+		"tpm2_getcap",
+		"properties-variable",
+	); err != nil {
+		return 0, err
+	}
+
+	return parsePersistentSlotsAvailable(out.String())
+}
+
+func parsePersistentSlotsAvailable(output string) (uint64, error) {
+	const property = "TPM2_PT_HR_PERSISTENT_AVAIL:"
+
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, property) {
+			continue
+		}
+
+		value := strings.TrimSpace(strings.TrimPrefix(line, property))
+		parsed, err := strconv.ParseUint(strings.TrimPrefix(value, "0x"), 16, 64)
+		if err != nil {
+			return 0, fmt.Errorf("invalid %s value %q: %w", property, value, err)
+		}
+
+		return parsed, nil
+	}
+
+	return 0, fmt.Errorf("%s was not reported by tpm2_getcap properties-variable", property)
+}
+
+func allocatePersistentHandle(handles map[uint64]struct{}) (string, error) {
+	for value := dynamicHandleFirst; value <= dynamicHandleLast; value++ {
+		if _, occupied := handles[value]; occupied {
+			continue
+		}
+
+		return fmt.Sprintf("0x%08x", value), nil
+	}
+
+	return "", fmt.Errorf(
+		"no free persistent handle in range 0x%08x..0x%08x",
+		dynamicHandleFirst,
+		dynamicHandleLast,
+	)
 }
 
 // objectName returns the TPM Name (hex) of an object referenced by a context
@@ -3026,22 +3448,8 @@ func writeMetadata(
 		return err
 	}
 
-	dirFile, err := os.Open(
-		cfg.dir,
-	)
-	if err != nil {
+	if err := syncDir(cfg.dir); err != nil {
 		return err
-	}
-
-	syncErr := dirFile.Sync()
-	closeErr := dirFile.Close()
-
-	if syncErr != nil {
-		return syncErr
-	}
-
-	if closeErr != nil {
-		return closeErr
 	}
 
 	return checkPathPerm(
@@ -3059,7 +3467,7 @@ func readMetadata(
 		return md, fmt.Errorf("state permissions: %w", err)
 	}
 
-	stateFD, err := syscall.Open(
+	stateFD, err := unix.Open(
 		cfg.dir,
 		syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW,
 		0,
@@ -3077,7 +3485,7 @@ func readMetadata(
 		return md, err
 	}
 
-	metadataFD, err := syscall.Openat(
+	metadataFD, err := unix.Openat(
 		stateFD,
 		"metadata.json",
 		syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW,
@@ -3101,9 +3509,12 @@ func readMetadata(
 		return md, err
 	}
 
-	data, err := io.ReadAll(metadataFile)
+	data, err := io.ReadAll(io.LimitReader(metadataFile, maxMetadataSize+1))
 	if err != nil {
 		return md, err
+	}
+	if len(data) > maxMetadataSize {
+		return md, fmt.Errorf("metadata exceeds %d bytes", maxMetadataSize)
 	}
 
 	if err := json.Unmarshal(
@@ -3169,8 +3580,7 @@ func enrollmentMetadata(
 func validateMetadata(md metadata) error {
 	if md.Version != metadataVersion {
 		return fmt.Errorf(
-			"unsupported metadata version %d, want %d; run %s purge then %s enroll "+
-				"(if purge refuses, %s)",
+			"unsupported metadata version %d, want %d; run %s purge then %s enroll; %s",
 			md.Version,
 			metadataVersion,
 			appName,
@@ -3523,6 +3933,26 @@ func checkStatePermissions(
 		cfg.metadata,
 		0600,
 	)
+}
+
+func syncDir(path string) error {
+	dirFile, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+
+	syncErr := dirFile.Sync()
+	closeErr := dirFile.Close()
+
+	if syncErr != nil {
+		return syncErr
+	}
+
+	if closeErr != nil {
+		return closeErr
+	}
+
+	return nil
 }
 
 // checkExistingStatePermissions verifies the existing state path without
@@ -3947,6 +4377,29 @@ func checkSecretServiceName() error {
 	return nil
 }
 
+func checkSecretServiceActivatable() (bool, error) {
+	conn, err := dbusConn()
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
+
+	obj := conn.Object(
+		"org.freedesktop.DBus",
+		dbus.ObjectPath("/org/freedesktop/DBus"),
+	)
+
+	var names []string
+	if err := obj.Call(
+		"org.freedesktop.DBus.ListActivatableNames",
+		0,
+	).Store(&names); err != nil {
+		return false, err
+	}
+
+	return stringInSlice(secretServiceName, names), nil
+}
+
 // privateUnlockInterfaceListed reports whether the Secret Service object
 // advertises the private gnome-keyring unlock interface in its introspection
 // data. The result is informational only.
@@ -3984,7 +4437,7 @@ func checkTPMReady() error {
 		"tpm2_getcap",
 		"properties-fixed",
 	); err != nil {
-		if advice, ok := tpmPermissionAdvice(); ok {
+		if advice, ok := tpmPermissionAdviceFor(os.Stderr); ok {
 			return fmt.Errorf(
 				"%w\n\n%s",
 				err,
@@ -4055,6 +4508,10 @@ func tpmDeviceSummary() (string, error) {
 }
 
 func tpmPermissionAdvice() (string, bool) {
+	return tpmPermissionAdviceFor(os.Stdout)
+}
+
+func tpmPermissionAdviceFor(output *os.File) (string, bool) {
 	info, err := os.Stat(
 		"/dev/tpmrm0",
 	)
@@ -4100,12 +4557,10 @@ func tpmPermissionAdvice() (string, bool) {
 		return "", false
 	}
 
-	groupIDs, err := current.GroupIds()
-	if err != nil {
-		return "", false
-	}
+	groupIDs := processGroupIDs()
+	accountGroupIDs, _ := current.GroupIds()
 
-	if stringInSlice(
+	if hasGroupID(
 		deviceGID,
 		groupIDs,
 	) {
@@ -4121,9 +4576,10 @@ func tpmPermissionAdvice() (string, bool) {
 
 	fmt.Fprintln(
 		&b,
-		colorize(
+		colorizeFor(
 			"TPM permission hint:",
 			colorYellow,
+			output,
 		),
 	)
 
@@ -4159,6 +4615,20 @@ func tpmPermissionAdvice() (string, bool) {
 		userGroupSummary(groupIDs),
 	)
 
+	if len(accountGroupIDs) > 0 && hasGroupID(deviceGID, accountGroupIDs) {
+		fmt.Fprintln(&b)
+		fmt.Fprintln(
+			&b,
+			"This account is already listed in the system group database, but the current session does not yet include that group.",
+		)
+		fmt.Fprintln(
+			&b,
+			"Fully log out of the graphical session and log back in, or reboot, before retrying.",
+		)
+
+		return strings.TrimRight(b.String(), "\n"), true
+	}
+
 	fmt.Fprintln(&b)
 
 	fmt.Fprintln(
@@ -4168,22 +4638,24 @@ func tpmPermissionAdvice() (string, bool) {
 
 	fmt.Fprintln(
 		&b,
-		colorize(
+		colorizeFor(
 			"Run this exact command:",
 			colorYellow,
+			output,
 		),
 	)
 
 	fmt.Fprintf(
 		&b,
 		"  %s\n",
-		colorize(
+		colorizeFor(
 			fmt.Sprintf(
 				"sudo usermod -aG %s %s",
 				shellQuote(groupForCommand),
 				shellQuote(username),
 			),
 			colorCyan,
+			output,
 		),
 	)
 
@@ -4202,7 +4674,7 @@ func tpmPermissionAdvice() (string, bool) {
 
 	fmt.Fprintln(
 		&b,
-		"Starting a new shell with 'exec fish' (or any shell) is not enough for group membership changes.",
+		"Starting a new shell or a new login shell is not enough for group membership changes.",
 	)
 
 	return strings.TrimRight(
@@ -4231,6 +4703,35 @@ func lookupGroupName(
 	}
 
 	return g.Name
+}
+
+func processGroupIDs() []string {
+	groups, _ := os.Getgroups()
+	out := make([]string, 0, len(groups)+2)
+	seen := make(map[string]struct{}, len(groups)+1)
+	appendGroup := func(gid int) {
+		value := strconv.Itoa(gid)
+		if _, exists := seen[value]; exists {
+			return
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+
+	for _, gid := range groups {
+		appendGroup(gid)
+	}
+
+	appendGroup(os.Getgid())
+
+	return out
+}
+
+func hasGroupID(
+	needle string,
+	haystack []string,
+) bool {
+	return stringInSlice(needle, haystack)
 }
 
 func userGroupSummary(
@@ -4305,7 +4806,7 @@ func printCheck(
 ) {
 	if err != nil {
 		fmt.Printf(
-			"%-24s %s: %v\n",
+			"%-28s %s: %v\n",
 			name,
 			colorize(
 				"fail",
@@ -4317,7 +4818,7 @@ func printCheck(
 	}
 
 	fmt.Printf(
-		"%-24s %s\n",
+		"%-28s %s\n",
 		name,
 		colorize(
 			"ok",
@@ -4343,7 +4844,7 @@ func printBool(
 	}
 
 	fmt.Printf(
-		"%-20s %s\n",
+		"%-28s %s\n",
 		name,
 		value,
 	)
@@ -4359,7 +4860,7 @@ func printStatePermissionsCheck(
 		os.ErrNotExist,
 	) {
 		fmt.Printf(
-			"%-24s %s %s\n",
+			"%-28s %s %s\n",
 			"state permissions",
 			colorize(
 				"ok",
@@ -4408,7 +4909,15 @@ func colorize(
 	s,
 	color string,
 ) string {
-	if !colorsEnabled() {
+	return colorizeFor(s, color, os.Stdout)
+}
+
+func colorizeFor(
+	s,
+	color string,
+	f *os.File,
+) string {
+	if !colorsEnabledFor(f) {
 		return s
 	}
 
@@ -4417,18 +4926,25 @@ func colorize(
 		colorReset
 }
 
-func colorsEnabled() bool {
+func colorizeStderr(
+	s,
+	color string,
+) string {
+	if !colorsEnabledFor(os.Stderr) {
+		return s
+	}
+
+	return color + s + colorReset
+}
+
+func colorsEnabledFor(f *os.File) bool {
 	if os.Getenv("NO_COLOR") != "" ||
 		os.Getenv("TERM") == "dumb" {
 		return false
 	}
 
-	info, err := os.Stdout.Stat()
-	if err != nil {
-		return false
-	}
-
-	return info.Mode()&os.ModeCharDevice != 0
+	_, err := unix.IoctlGetTermios(int(f.Fd()), unix.TCGETS)
+	return err == nil
 }
 
 // quoteSystemdArg quotes an argument for a systemd ExecStart= line. Besides
@@ -4525,6 +5041,7 @@ func runCmdOut(
 		path,
 		args...,
 	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	cmd.Env = childEnv()
 	cmd.Stdin = stdin
@@ -4573,6 +5090,7 @@ func runDiagnosticCmd(
 		path,
 		args...,
 	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	cmd.Env = childEnv()
 	cmd.Stdout = io.Discard
@@ -4760,37 +5278,17 @@ func readLineInto(
 
 func getTermios(
 	fd int,
-) (syscall.Termios, error) {
-	var t syscall.Termios
-
-	_, _, errno := syscall.Syscall(
-		syscall.SYS_IOCTL,
-		uintptr(fd),
-		uintptr(syscall.TCGETS),
-		uintptr(unsafe.Pointer(&t)),
-	)
-
-	if errno != 0 {
-		return t, errno
+) (unix.Termios, error) {
+	t, err := unix.IoctlGetTermios(fd, unix.TCGETS)
+	if err != nil {
+		return unix.Termios{}, err
 	}
-
-	return t, nil
+	return *t, nil
 }
 
 func setTermios(
 	fd int,
-	t syscall.Termios,
+	t unix.Termios,
 ) error {
-	_, _, errno := syscall.Syscall(
-		syscall.SYS_IOCTL,
-		uintptr(fd),
-		uintptr(syscall.TCSETS),
-		uintptr(unsafe.Pointer(&t)),
-	)
-
-	if errno != 0 {
-		return errno
-	}
-
-	return nil
+	return unix.IoctlSetTermios(fd, unix.TCSETS, &t)
 }

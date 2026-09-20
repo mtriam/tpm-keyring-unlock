@@ -2,14 +2,46 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/godbus/dbus/v5"
 )
+
+func TestValidateCommandFlags(t *testing.T) {
+	statusFlags := flag.NewFlagSet("status", flag.ContinueOnError)
+	statusFlags.String("pcrs", "", "")
+	if err := statusFlags.Parse([]string{"-pcrs", "sha256:7"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCommandFlags("status", statusFlags); err == nil {
+		t.Fatal("validateCommandFlags accepted -pcrs for status")
+	}
+
+	statusFlags = flag.NewFlagSet("status", flag.ContinueOnError)
+	statusFlags.Duration("timeout", 0, "")
+	if err := statusFlags.Parse([]string{"-timeout", "1s"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCommandFlags("status", statusFlags); err != nil {
+		t.Fatalf("validateCommandFlags rejected -timeout for status: %v", err)
+	}
+
+	purgeFlags := flag.NewFlagSet("purge", flag.ContinueOnError)
+	purgeFlags.String("handle", "", "")
+	if err := purgeFlags.Parse([]string{"-handle", "0x81018044"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCommandFlags("purge", purgeFlags); err != nil {
+		t.Fatalf("validateCommandFlags rejected -handle for purge: %v", err)
+	}
+}
 
 func TestHandleRE(t *testing.T) {
 	tests := []struct {
@@ -682,6 +714,102 @@ func TestWithRetryTimeout(t *testing.T) {
 	}
 }
 
+func TestResolveCollectionWithRetryRetriesTransientUnknownObject(t *testing.T) {
+	const recorded = "/org/freedesktop/secrets/collection/login"
+	const defaultCollection = "/org/freedesktop/secrets/collection/default"
+	calls := 0
+
+	got, err := resolveCollectionWithRetry(
+		"",
+		recorded,
+		2*retryInterval+200*time.Millisecond,
+		func(collection string) (bool, error) {
+			calls++
+			if collection == recorded {
+				return false, &dbus.Error{
+					Name: "org.freedesktop.DBus.Error.UnknownObject",
+				}
+			}
+			if calls < 3 {
+				return false, &dbus.Error{
+					Name: "org.freedesktop.DBus.Error.UnknownObject",
+				}
+			}
+			return true, nil
+		},
+		func() (string, error) {
+			return defaultCollection, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("resolveCollectionWithRetry returned error: %v", err)
+	}
+	if got != defaultCollection {
+		t.Fatalf("resolveCollectionWithRetry() = %q, want %q", got, defaultCollection)
+	}
+	if calls < 3 {
+		t.Fatalf("collection check called %d times, want at least 3", calls)
+	}
+}
+
+func TestResolveCollectionWithRetryDoesNotFallbackOnTransientRecordedError(t *testing.T) {
+	const recorded = "/org/freedesktop/secrets/collection/login"
+	defaultCalls := 0
+
+	_, err := resolveCollectionWithRetry(
+		"",
+		recorded,
+		2*retryInterval+200*time.Millisecond,
+		func(string) (bool, error) {
+			return false, &dbus.Error{
+				Name: "org.freedesktop.DBus.Error.NoReply",
+			}
+		},
+		func() (string, error) {
+			defaultCalls++
+			return "/org/freedesktop/secrets/collection/default", nil
+		},
+	)
+
+	if err == nil {
+		t.Fatal("resolveCollectionWithRetry returned nil error")
+	}
+	if defaultCalls != 0 {
+		t.Fatalf("default alias was queried %d times, want 0", defaultCalls)
+	}
+}
+
+func TestSecretBufferStartsEmptyAndReleaseZerosCapacity(t *testing.T) {
+	buf := newSecretBuf(32)
+	if len(buf) != 0 {
+		t.Fatalf("newSecretBuf length = %d, want 0", len(buf))
+	}
+	if cap(buf) < 32 {
+		t.Fatalf("newSecretBuf capacity = %d, want at least 32", cap(buf))
+	}
+
+	full := buf[:cap(buf)]
+	for i := range full {
+		full[i] = 0x5a
+	}
+	releaseSecretBuf(buf)
+
+	for i, value := range full {
+		if value != 0 {
+			t.Fatalf("buffer byte %d = %d after release, want 0", i, value)
+		}
+	}
+}
+
+func TestHasGroupIDUsesCurrentProcessGroups(t *testing.T) {
+	gid := strconv.Itoa(os.Getgid())
+	groups := processGroupIDs()
+
+	if !hasGroupID(gid, groups) {
+		t.Fatalf("os.Getgid()=%s not found in process groups %v", gid, groups)
+	}
+}
+
 func TestValidatePersistentHandle(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -782,6 +910,125 @@ func TestValidatePersistentHandle(t *testing.T) {
 	}
 }
 
+func TestAllocatePersistentHandle(t *testing.T) {
+	tests := []struct {
+		name     string
+		occupied map[uint64]struct{}
+		want     string
+	}{
+		{
+			name: "first handle in range",
+			want: "0x81018000",
+		},
+		{
+			name: "skips occupied handles",
+			occupied: map[uint64]struct{}{
+				dynamicHandleFirst:     {},
+				dynamicHandleFirst + 1: {},
+			},
+			want: "0x81018002",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := allocatePersistentHandle(tt.occupied)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if got != tt.want {
+				t.Fatalf("allocated handle = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateInstallPath(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := os.MkdirTemp(wd, "install-path-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+
+	tests := []struct {
+		name      string
+		setupPath func(t *testing.T) string
+		wantErr   bool
+	}{
+		{
+			name: "secure executable path",
+			setupPath: func(t *testing.T) string {
+				path := filepath.Join(root, "secure", "bin", "tpm-keyring-unlock")
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0755); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			},
+		},
+		{
+			name: "group writable parent directory",
+			setupPath: func(t *testing.T) string {
+				parent := filepath.Join(root, "shared")
+				if err := os.MkdirAll(parent, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(parent, 0777); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(parent, "tpm-keyring-unlock")
+				if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0755); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := tt.setupPath(t)
+			path, err = filepath.Abs(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			err = validateInstallPath(path)
+			if tt.wantErr && err == nil {
+				t.Fatal("validateInstallPath returned nil error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("validateInstallPath returned error: %v", err)
+			}
+		})
+	}
+}
+
+func TestParsePersistentSlotsAvailable(t *testing.T) {
+	output := "TPM2_PT_HR_PERSISTENT: 0x3\nTPM2_PT_HR_PERSISTENT_AVAIL: 0xD\n"
+
+	got, err := parsePersistentSlotsAvailable(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 13 {
+		t.Fatalf("persistent slots available = %d, want 13", got)
+	}
+
+	if _, err := parsePersistentSlotsAvailable("TPM2_PT_HR_PERSISTENT: 0x3\n"); err == nil {
+		t.Fatal("parsePersistentSlotsAvailable accepted output without availability property")
+	}
+}
+
 func TestRejectSymlinkComponents(t *testing.T) {
 	root := t.TempDir()
 	target := filepath.Join(root, "target")
@@ -837,5 +1084,61 @@ func TestStateMetadataRejectsSymlinks(t *testing.T) {
 	stateCfg.refreshPaths()
 	if _, err := readMetadata(stateCfg); err == nil {
 		t.Fatal("readMetadata accepted a symlinked metadata file")
+	}
+}
+
+func TestChildEnvDropsTPMAndLoaderVariables(t *testing.T) {
+	oldEnv := os.Environ()
+	defer func() {
+		for _, kv := range oldEnv {
+			parts := strings.SplitN(kv, "=", 2)
+			if len(parts) == 2 {
+				_ = os.Setenv(parts[0], parts[1])
+			}
+		}
+	}()
+
+	if err := os.Setenv("LD_PRELOAD", "/tmp/evil.so"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("TPM2TOOLS_TCTI", "tabrmd"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("TSS2_LOG", "trace"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("HOME", "/tmp/home"); err != nil {
+		t.Fatal(err)
+	}
+
+	env := childEnv()
+	for _, kv := range env {
+		name, _, _ := strings.Cut(kv, "=")
+		switch name {
+		case "LD_PRELOAD", "TPM2TOOLS_TCTI", "TSS2_LOG":
+			t.Fatalf("childEnv leaked %s into child process: %q", name, kv)
+		}
+	}
+	if !strings.HasPrefix(env[len(env)-1], "PATH=") {
+		t.Fatal("childEnv did not replace PATH")
+	}
+}
+
+func TestReadMetadataRejectsOversizeFile(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	if err := os.Mkdir(state, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := strings.Repeat("x", maxMetadataSize+1)
+	if err := os.WriteFile(filepath.Join(state, "metadata.json"), []byte(payload), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	stateCfg := config{dir: state}
+	stateCfg.refreshPaths()
+	if _, err := readMetadata(stateCfg); err == nil {
+		t.Fatal("readMetadata accepted a file larger than maxMetadataSize")
 	}
 }

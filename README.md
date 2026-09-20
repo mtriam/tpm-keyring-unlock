@@ -11,34 +11,36 @@ https://github.com/Tunahanyrd/tpm-keyring-unlock/tree/main
 <summary><strong>🔍 Differences from the original</strong></summary>
 
 This fork keeps the original goal and GNOME Keyring integration, but significantly
-changes the TPM and state-management design.
+changes the TPM, collection-discovery, and state-management design compared with
+the initial public release (`19bcc53`).
 
 Main differences:
 
-- Uses a persistent TPM sealed object instead of storing `keyring.pub` and
-  `keyring.priv` in the filesystem.
-- Verifies the TPM object's Name before using or removing the configured
-  persistent handle.
-- Adds configurable persistent TPM handle support (default: `0x81018043`).
-- Automatically detects the live Secret Service `default` collection instead of
-  relying on a hardcoded GNOME Keyring object path.
-- Stores validated enrollment metadata including the collection, PCR selection,
-  TPM handle, and TPM object Name.
-- Adds strict validation for PCR selections, TPM handles, D-Bus object paths,
-  metadata, and protected state permissions.
-- Uses explicit PCR policy creation and verification during TPM enrollment and
-  unsealing.
-- Adds transactional enrollment, self-tests, rollback, and safer `purge`
-  handling for persistent TPM objects.
-- Adds `status` and `doctor` checks for the persistent TPM object and its
-  identity.
-- Adds a permanent Go unit-test suite for the security-critical validation and
-  state-management code.
-- Can be significantly faster than the original in some configurations because
-  the sealed object is persistent in the TPM and does not need to be recreated
-  and loaded from filesystem state on every unlock. On the author's system,
-  unlock time improved from approximately 2.5 seconds with the original to
-  approximately 0.2 seconds with this fork.
+- Replaces filesystem TPM state (`keyring.pub`, `keyring.priv`, and
+    `secret.sha256`) with a sealed object stored persistently in the TPM.
+- On the author's system, unlock time improved from approximately 2.5 seconds
+    in the initial version to approximately 0.2 seconds with this fork. Actual
+    performance depends on the TPM, system configuration, and session timing.
+- Adds configurable persistent-handle support, automatic allocation of a free
+    handle when the default is occupied, and protection against overwriting an
+    unrelated TPM object.
+- Stores the persistent object's TPM Name and verifies it before unlock, status,
+    purge, or removal, preventing a foreign object from being trusted by handle
+    alone.
+- Replaces the initial hardcoded default-collection path with runtime discovery
+    through Secret Service `ReadAlias("default")`.
+- Reworks enrollment metadata to record and validate the selected collection,
+    PCR policy, persistent handle, and TPM object Name.
+- Adds explicit PCR-policy construction and verification, with stricter checks
+    for PCR selections, handles, D-Bus paths, metadata, and protected state.
+- Adds transactional enrollment, TPM self-tests, rollback, atomic metadata
+    writes, and safer purge behavior for missing, foreign, or stale state.
+- Extends `status` and `doctor` with persistent-object identity, PCR, D-Bus,
+    Secret Service, systemd, permissions, and handle-availability diagnostics.
+- Adds a permanent Go test suite covering security-sensitive validation and
+    state management, plus `build.sh` for formatting, tests, and static builds.
+- Expands release automation from the initial single Linux amd64 artifact to
+    Linux amd64 and arm64 binaries with checksums.
 
 The actual performance improvement depends on the TPM, system configuration,
 GNOME Keyring startup timing, and other local factors.
@@ -60,9 +62,13 @@ The selected collection and PCR policy are stored in `metadata.json` and
 reused by later `unlock` calls.
 
 The sealed TPM object is stored persistently in the TPM under a configurable
-persistent handle. The default handle is:
+persistent handle. Enrollment uses this handle by default:
 
     0x81018043
+
+If the default handle is occupied, enrollment automatically selects the first
+free handle in `0x81018000 .. 0x8101ffff`. Supplying `--handle` disables this
+automatic selection and keeps the requested handle explicit.
 
 The tool stores the TPM object's Name in `metadata.json` and verifies that the
 object currently occupying the configured handle is the same object that was
@@ -86,34 +92,25 @@ systemd unit, logs, or shell history.
 
 ### What was added in this version
 
-- Persistent TPM-backed enrollment with a verified persistent handle instead of
-  storing key material in the filesystem.
-- Metadata validation and persistence for the Secret Service collection, PCR
-  policy, TPM handle, and TPM object Name.
-- Safer handling of persistent TPM objects, including verification before use,
-  removal, and purge.
-- Reworked and hardened `status` and `doctor` checks for enrollment state,
-  TPM identity, D-Bus, Secret Service, and systemd setup.
-- Transactional enrollment and rollback logic for partially completed TPM state.
-- More strict validation for PCR selections, handle format, collection paths,
-  and protected local state.
-- A permanent Go test suite covering the security-sensitive validation and
-  state-management logic.
+- Persistent TPM-backed enrollment with the sealed secret kept in the TPM,
+  rather than in filesystem key material.
+- Verified TPM object identity: the stored TPM Name is checked before unlock,
+  status, purge, or removal of a persistent object.
+- Configurable persistent handles with automatic selection of a free handle when
+  the default handle is occupied, while leaving existing objects untouched.
+- Versioned, validated enrollment metadata for the collection, PCR policy,
+    persistent handle, and TPM object Name.
+- Dynamic discovery of the live Secret Service `default` collection instead of
+  relying on a hardcoded GNOME Keyring object path.
+- Explicit PCR policy creation and verification, including strict validation of
+  PCR banks, indexes, handles, D-Bus paths, and protected state permissions.
+- Transactional enrollment with self-tests, rollback, atomic metadata writes,
+  and cleanup support for stale metadata through `purge --forget-metadata`.
+- Reworked `status` and `doctor` diagnostics covering TPM identity, D-Bus,
+  Secret Service, systemd, permissions, PCR state, and available handles.
+- A permanent Go test suite for security-sensitive validation and state
+  management, plus a reproducible static release build via `build.sh`.
 
-### Major changes from the original project
-
-- The original project relied on filesystem state and recreated sealed material
-  more directly; this fork keeps the secret persistently in the TPM.
-- The current version verifies the TPM object's Name before trusting a persistent
-  handle, reducing the risk of using a foreign TPM object.
-- It resolves the live default Secret Service collection dynamically instead of
-  assuming a fixed object path.
-- It supports explicit persistent handle selection and stores the selected
-enrollment configuration in metadata for later unlocks.
-- It adds `status`, `doctor`, purge safety checks, and stronger state protection
-  for the local metadata and protected files.
-- It keeps the same GNOME Keyring unlock goal, but changes the implementation
-  around TPM identity verification and safer persistent-state handling.
 
 <details>
 <summary><strong>🔍 Alternative project: dmitriitimoshenko/tpm-keyring-unlock</strong></summary>
@@ -163,7 +160,15 @@ https://github.com/dmitriitimoshenko/tpm-keyring-unlock
 
 Install the required build, Git, and TPM tools:
 
+**Arch Linux:**
+
     sudo pacman -S --needed git go tpm2-tools gnome-keyring
+
+**Debian/Ubuntu:**
+
+    sudo apt update
+    sudo apt install -y git golang-go tpm2-tools gnome-keyring
+
 
 The system also needs:
 
@@ -181,6 +186,11 @@ Build and test:
 
 The build script formats the Go source, runs the test suite, and builds the
 static release binary.
+
+For `install`, use a permanent binary path. The binary itself must be a
+non-symlinked executable regular file owned either by `root` or by the current
+user. Every parent directory on that path must be non-symlinked and not
+writable by group or others.
 
 Run environment checks:
 
@@ -209,23 +219,23 @@ By default, the tool uses persistent TPM handle:
 
     0x81018043
 
-If this handle is already occupied by another TPM object, `enroll` will refuse
-to overwrite or remove it.
+If this handle is already occupied by another TPM object, automatic enrollment
+will select a free handle from `0x81018000 .. 0x8101ffff`; it will never
+overwrite or remove the existing object.
 
 Check the persistent TPM handles:
 
     tpm2_getcap handles-persistent
 
-If `0x81018043` is already in use, you have two options.
+Normally no action is needed: `enroll` automatically uses the first free
+handle in the allocation range. To choose the handle yourself, pass
+`--handle` with a free handle, for example:
 
-Use a different persistent handle that is not currently present in
-`tpm2_getcap handles-persistent`, for example:
+    ./tpm-keyring-unlock enroll -handle 0x81018044
 
-    ./tpm-keyring-unlock enroll --handle 0x81018044
-
-This creates a fresh enrollment in a free TPM persistent handle. Pick any
-unused handle in the valid persistent range (`0x81000000 .. 0x81ffffff`), not
-just the next number.
+This creates a fresh enrollment in the requested free TPM persistent handle.
+The requested handle must not already be present in `tpm2_getcap
+handles-persistent`.
 
 Or, if the existing object belongs to this application, remove the enrollment
 first:
@@ -241,7 +251,7 @@ persistent object. It will refuse to remove an object that cannot be verified
 as belonging to this enrollment.
 
 If you are unsure who owns an existing persistent handle, do not remove it.
-Choose another unused handle instead.
+Automatic allocation will leave it untouched and use another free handle.
 
 To inspect the current enrollment and TPM object state:
 
@@ -293,22 +303,31 @@ because the application verifies the TPM object's Name before removing it.
 
 Useful options:
 
-    --pcrs sha256:7
-    --timeout 30s
-    --collection /org/freedesktop/secrets/collection/login
-    --state-dir ~/.local/share/tpm-keyring-unlock
-    --handle 0x81018043
+    -pcrs sha256:7
+    -timeout 30s
+    -collection /org/freedesktop/secrets/collection/login
+    -state-dir ~/.local/share/tpm-keyring-unlock
+    -handle 0x81018043
 
-`--handle` selects the TPM persistent handle used for the sealed object.
+The built-in help and the program's canonical examples use single-dash flags
+such as `-pcrs` and `-handle`. The Go flag parser also accepts the common
+`--flag` form on most systems, but the single-dash form matches the CLI help
+output exactly.
+
+`-handle` selects the TPM persistent handle used for the sealed object.
 The default is `0x81018043`.
 
 Persistent handles are TPM-wide, not per-user. If multiple users on the same
 machine use this program, they must use different persistent handles and
 separate state directories.
 
-The persistent handle must be inside the TPM persistent-handle range:
+The persistent handle must be inside the TPM owner persistent-handle range used
+by `tpm2_evictcontrol -C o`:
 
-    0x81000000 .. 0x81ffffff
+    0x81000000 .. 0x817fffff
+
+The platform-controlled half of the global persistent range
+(`0x81800000 .. 0x81ffffff`) is intentionally rejected.
 
 If `--collection` is omitted, the tool reads the active default Secret Service
 alias at runtime and uses that exact object path. This avoids assuming a fixed
@@ -631,9 +650,16 @@ Run:
     collection lock state
     state directory permissions
     systemd availability
+    available persistent TPM handle slots
 
 The TPM tool checks include commands needed by the current persistent-object
 and PCR-policy workflow.
+
+To inspect an orphaned persistent handle when local metadata is missing, pass
+the handle explicitly to `purge`; the command will warn without evicting an
+object whose identity cannot be verified:
+
+    ./tpm-keyring-unlock purge -handle 0x81018044
 
 If `/dev/tpmrm0` is group-writable but your user is not in that actual device
 group, `doctor` prints the owner/group, your groups, and this kind of fix:
