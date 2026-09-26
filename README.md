@@ -10,37 +10,42 @@ https://github.com/Tunahanyrd/tpm-keyring-unlock/tree/main
 
 <summary><strong>🔍 Differences from the original</strong></summary>
 
+Here, “the original” means the initial public-release state from which this
+fork started, commit `19bcc53` (“Initial public release”).
+
 This fork keeps the original goal and GNOME Keyring integration, but significantly
-changes the TPM, collection-discovery, and state-management design compared with
-the initial public release (`19bcc53`).
+changes the TPM, collection-discovery, enrollment-metadata, and state-management
+design compared with that baseline.
 
 Main differences:
 
 - Replaces filesystem TPM state (`keyring.pub`, `keyring.priv`, and
-    `secret.sha256`) with a sealed object stored persistently in the TPM.
+  `secret.sha256`) with a sealed object stored persistently in the TPM.
 - On the author's system, unlock time improved from approximately 2.5 seconds
-    in the initial version to approximately 0.2 seconds with this fork. Actual
-    performance depends on the TPM, system configuration, and session timing.
+  in the initial version to approximately 0.2 seconds with this fork. Actual
+  performance depends on the TPM, system configuration, and session timing.
 - Adds configurable persistent-handle support, automatic allocation of a free
-    handle when the default is occupied, and protection against overwriting an
-    unrelated TPM object.
+  handle when the default is occupied, and protection against overwriting an
+  unrelated TPM object.
 - Stores the persistent object's TPM Name and verifies it before unlock, status,
-    purge, or removal, preventing a foreign object from being trusted by handle
-    alone.
-- Replaces the initial hardcoded default-collection path with runtime discovery
-    through Secret Service `ReadAlias("default")`.
-- Reworks enrollment metadata to record and validate the selected collection,
-    PCR policy, persistent handle, and TPM object Name.
+  purge, or removal, preventing a foreign object from being trusted by handle
+  alone.
+- Replaces the hardcoded collection path with runtime lookup via Secret Service `ReadAlias("default")`.
+- Records and validates enrollment metadata, including the selected collection,
+  PCR policy, persistent handle, and TPM object Name.
+- Encrypts the keyring password with a random per-enrollment AES-256-GCM key
+  before sealing the ciphertext into the TPM; the wrapping key and nonce are
+  stored in protected local metadata.
 - Adds explicit PCR-policy construction and verification, with stricter checks
-    for PCR selections, handles, D-Bus paths, metadata, and protected state.
+  for PCR selections, handles, D-Bus paths, metadata, and protected state.
 - Adds transactional enrollment, TPM self-tests, rollback, atomic metadata
-    writes, and safer purge behavior for missing, foreign, or stale state.
+  writes, and safer purge behavior for missing, foreign, or stale state.
 - Extends `status` and `doctor` with persistent-object identity, PCR, D-Bus,
-    Secret Service, systemd, permissions, and handle-availability diagnostics.
+  Secret Service, systemd, permissions, and handle-availability diagnostics.
 - Adds a permanent Go test suite covering security-sensitive validation and
-    state management, plus `build.sh` for formatting, tests, and static builds.
+  state management, plus `build.sh` for formatting, tests, and static builds.
 - Expands release automation from the initial single Linux amd64 artifact to
-    Linux amd64 and arm64 binaries with checksums.
+  Linux amd64 and arm64 binaries with checksums.
 
 The actual performance improvement depends on the TPM, system configuration,
 GNOME Keyring startup timing, and other local factors.
@@ -54,7 +59,8 @@ unchanged.
 Unlock GNOME Keyring using a TPM2-sealed secret.
 
 Small local-only CLI that unlocks the real GNOME Keyring default collection
-after passwordless login, using a TPM2-sealed keyring master password.
+after passwordless login, using a TPM2-sealed, AES-GCM-encrypted keyring master
+password.
 
 During enrollment, the tool resolves the live default Secret Service
 collection via `org.freedesktop.Secret.Service.ReadAlias("default")`.
@@ -90,26 +96,13 @@ systemd unit, logs, or shell history.
 
 ## Summary
 
-### What was added in this version
+### Recent changes
 
-- Persistent TPM-backed enrollment with the sealed secret kept in the TPM,
-  rather than in filesystem key material.
-- Verified TPM object identity: the stored TPM Name is checked before unlock,
-  status, purge, or removal of a persistent object.
-- Configurable persistent handles with automatic selection of a free handle when
-  the default handle is occupied, while leaving existing objects untouched.
-- Versioned, validated enrollment metadata for the collection, PCR policy,
-    persistent handle, and TPM object Name.
-- Dynamic discovery of the live Secret Service `default` collection instead of
-  relying on a hardcoded GNOME Keyring object path.
-- Explicit PCR policy creation and verification, including strict validation of
-  PCR banks, indexes, handles, D-Bus paths, and protected state permissions.
-- Transactional enrollment with self-tests, rollback, atomic metadata writes,
-  and cleanup support for stale metadata through `purge --forget-metadata`.
-- Reworked `status` and `doctor` diagnostics covering TPM identity, D-Bus,
-  Secret Service, systemd, permissions, PCR state, and available handles.
-- A permanent Go test suite for security-sensitive validation and state
-  management, plus a reproducible static release build via `build.sh`.
+- Encrypts the password with a random per-enrollment AES-256-GCM key before sealing; TPM stores ciphertext, while `metadata.json` stores the wrapping key and nonce.
+- Decrypts and authenticates the unsealed value during unlock, and verifies the plaintext in both enrollment self-tests.
+- Bumps metadata format from version 5 to 6; existing enrollments need `purge` followed by `enroll` before reuse.
+- Validates the wrapping key and nonce and adds tests for round-trip encryption, wrong keys, and tampered ciphertext.
+- Expands `doctor` security notes to explain that wrapping does not protect against a local process with access to both metadata and TPM, and that deleting metadata leaves the TPM handle occupied until `purge`.
 
 
 <details>
@@ -119,9 +112,9 @@ There is another project with the same general goal:
 
 https://github.com/dmitriitimoshenko/tpm-keyring-unlock
 
-It takes a different architectural approach.
+That project follows a different architecture.
 
-This project:
+This repository:
 
 - does not modify PAM;
 - runs as a user systemd service;
@@ -142,7 +135,7 @@ The alternative project integrates directly with the PAM authentication stack:
 
 The two projects therefore solve a similar problem at different layers:
 
-    This project:
+    This repository:
     login -> systemd user service -> Secret Service D-Bus -> GNOME Keyring
 
     Alternative project:
@@ -357,6 +350,8 @@ Enrollment performs the following high-level sequence:
     check that the selected TPM persistent handle is unused
     read the GNOME Keyring master password
     verify the password against the selected collection
+    generate a random AES-256-GCM key and nonce
+    encrypt the password; pass only the ciphertext to the TPM
     create the TPM primary object
     create a PCR policy
     create the sealed object
@@ -366,8 +361,15 @@ Enrollment performs the following high-level sequence:
     self-test the persistent object
     atomically write metadata
 
-The password is held only in memory while it is needed and is explicitly
-zeroed after use.
+The application explicitly zeroes its plaintext and raw wrapping-key buffers
+after use where possible. Go cannot guarantee that temporary runtime or
+serialization copies are erased. The ciphertext is sealed into the TPM;
+`metadata.json` stores the wrapping key and nonce needed to recover it after
+unseal.
+
+Metadata version 6 adds these wrapping fields. Existing enrollments with an
+older metadata version must be removed with `purge` and created again with
+`enroll`; they cannot be unlocked by this version.
 
 The enrollment refuses to overwrite an existing enrollment. To create a new
 enrollment, purge the existing enrollment first.
@@ -387,8 +389,9 @@ The current enrollment stores:
 
     metadata.json
 
-The sealed secret itself is stored in the TPM, not as `keyring.pub` and
-`keyring.priv` files on disk.
+The encrypted secret is sealed in the TPM. Temporary TPM creation files are
+used during enrollment and removed afterwards; no sealed key files are kept
+in the state directory.
 
 `metadata.json` contains information such as:
 
@@ -399,8 +402,12 @@ The sealed secret itself is stored in the TPM, not as `keyring.pub` and
     PCR selection
     persistent TPM handle
     TPM object Name
+    AES-256-GCM wrapping key (hex encoded)
+    AES-GCM nonce (hex encoded)
 
-The GNOME Keyring master password is not stored in `metadata.json`.
+The plaintext GNOME Keyring master password is not stored in `metadata.json`.
+The wrapping key is stored there, so metadata alone is not a password vault;
+the corresponding ciphertext remains sealed in the TPM.
 
 The TPM Name is used to verify that the object currently present at the
 configured persistent handle is the same object that was enrolled.
@@ -408,6 +415,38 @@ configured persistent handle is the same object that was enrolled.
 The state directory must be owned by the current user and have mode `0700`.
 Metadata must have mode `0600`. Symlinks are not accepted for protected state
 files.
+
+## Security Model
+
+Only the AES-GCM ciphertext is sealed in the TPM. The plaintext keyring master
+password is recovered in process memory during unlock. `metadata.json` does not
+contain the plaintext password, but it does contain the wrapping key and nonce
+needed to decrypt the sealed ciphertext.
+
+Wrapping does not protect against a process that can read `metadata.json` and
+use the TPM while the enrolled PCR state matches. The TPM policy has no PIN or
+`authValue`; it is based on PCRs only. A process running as the same user can
+normally read the metadata and access `/dev/tpmrm0`.
+
+The PCR policy is intended to prevent recovery from a disk-only copy without
+access to the enrolled TPM in the matching measured-boot state. It does not
+protect against a compromised session, root access, or a process able to use
+the TPM while the policy is satisfied. After unlock, processes running as the
+logged-in user can access secrets available through the unlocked keyring.
+
+The password is read interactively, not passed through argv, environment
+variables, shell history, systemd unit files, or logs. The application zeroes
+sensitive byte buffers after use where possible, but Go cannot guarantee that
+all temporary runtime or serialization copies are erased.
+
+Unlock uses GNOME Keyring's private, unsupported D-Bus interface. The Secret
+Service session used here is not encrypted on the session bus.
+
+Deleting `metadata.json` removes the local wrapping key, leaving the TPM-sealed
+ciphertext unrecoverable through the normal application flow. This is
+cryptographic erasure only if every copy of the metadata is gone; backups and
+snapshots retain the key. Deleting the metadata does not evict the persistent
+TPM object; use `purge` to remove it and free its handle.
 
 
 ## TPM Persistent Object
@@ -699,42 +738,6 @@ runs:
 Use `purge` to remove the TPM enrollment.
 
 Use `uninstall` to remove the systemd user service.
-
-
-## Security Model
-
-The GNOME Keyring master password is stored only inside a TPM2-sealed object.
-
-The password is not stored in plaintext on disk.
-
-The password is not passed via:
-
-    argv
-    environment variables
-    shell history
-    systemd unit files
-    logs
-
-The sealed object is protected by a TPM PCR policy.
-
-The program also records the TPM object's Name and verifies it before using
-the persistent object.
-
-The local metadata does not contain the keyring master password.
-
-During enrollment, the password is read interactively and is not supplied as a
-command-line argument.
-
-After the password is no longer needed, the program explicitly zeroes the
-corresponding memory buffer.
-
-If TPM unseal succeeds, the keyring is unlocked automatically.
-
-This means that any process running as the logged-in user may access secrets
-that are normally available through an unlocked GNOME Keyring.
-
-This tool improves usability for passwordless login setups. It does not provide
-stronger protection than a locked user session.
 
 
 ## TPM Security Notes

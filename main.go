@@ -6,16 +6,28 @@
 // policy is a PCR policy. At login a systemd user service unseals it and
 // unlocks the default Secret Service collection.
 //
+// Before sealing, the password is encrypted with a random AES-256-GCM key
+// (see "Secret wrapping" below). The TPM only ever stores/unseals
+// ciphertext; the key lives solely in metadata.json.
+//
 // Threat model (see also "doctor"):
 //   - protects against offline disk theft and against changes to the selected
 //     measured boot state;
 //   - does NOT protect against a process that can use /dev/tpmrm0 while the
-//     PCRs match, because the policy has no authValue/PIN.
+//     PCRs match, because the policy has no authValue/PIN; that same process
+//     can typically also read metadata.json (same UID), so the wrap key adds
+//     no protection against this specific attacker;
+//   - deleting every copy of metadata.json removes the wrap key needed to
+//     recover the sealed ciphertext; the persistent TPM object remains
+//     occupied until "purge" evicts it.
 package main
 
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	crand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -47,7 +59,7 @@ const (
 	defaultSealedHandle    = "0x81018043"
 	dynamicHandleFirst     = uint64(0x81018000)
 	dynamicHandleLast      = uint64(0x8101ffff)
-	metadataVersion        = 5
+	metadataVersion        = 6
 	maxSealedSecretSize    = 128
 	maxPasswordInput       = 4096
 	unsealBufferSize       = 2048
@@ -56,6 +68,20 @@ const (
 	maxMetadataSize        = 64 * 1024
 	externalCommandTimeout = 30 * time.Second
 	statusTimeout          = 3 * time.Second
+
+	// wrapKeySize and wrapNonceSize are the AES-256-GCM key and nonce sizes
+	// used to encrypt the keyring password before it is sealed into the TPM.
+	// The key and nonce are stored (hex-encoded) only in metadata.json:
+	// deleting that file destroys the key and makes the TPM-sealed
+	// ciphertext permanently unrecoverable, even though the persistent TPM
+	// object itself is untouched until "purge" evicts it.
+	wrapKeySize   = 32
+	wrapNonceSize = 12
+
+	// aesGCMOverhead is the fixed size of the GCM authentication tag that
+	// wrapSecret appends to the ciphertext. It reduces the usable password
+	// length within maxSealedSecretSize.
+	aesGCMOverhead = 16
 
 	// Errors that are neither classified as transient nor permanent are
 	// retried only this many times, so that e.g. a wrong password does not
@@ -127,6 +153,18 @@ type metadata struct {
 	// It is used to verify that the persistent handle still refers to
 	// the object enrolled by this tool.
 	HandleName string `json:"handle_name"`
+
+	// WrapKey is the hex-encoded AES-256-GCM key used to encrypt the
+	// keyring password before it was sealed into the TPM. The TPM only
+	// ever sees ciphertext. Deleting every copy of metadata.json removes
+	// the wrap key needed to recover the sealed ciphertext. The persistent
+	// TPM object remains occupied until "purge" evicts it.
+	WrapKey string `json:"wrap_key"`
+
+	// WrapNonce is the hex-encoded AES-GCM nonce used with WrapKey. Reuse
+	// across unlocks is safe here because WrapKey is used to encrypt
+	// exactly once, at enroll time; every unlock only decrypts.
+	WrapNonce string `json:"wrap_nonce"`
 }
 
 type secretValue struct {
@@ -354,6 +392,12 @@ Usage:
   %[1]s doctor    [-pcrs sha256:7] [-collection PATH] [-state-dir DIR]
 
 Enrollment is persistent-only. There is no sealed-file fallback.
+
+The keyring password is encrypted with a random per-enrollment AES-256-GCM
+key before it is sealed into the TPM; that key lives only in metadata.json
+(see the "doctor" security notes). Deleting every copy of metadata.json makes
+the sealed ciphertext unrecoverable through this app, but does not evict the
+TPM object.
 
 When -handle is omitted and the default handle %[2]s is occupied, enroll
 selects the first free handle in 0x81018000..0x8101FFFF. An explicitly
@@ -1058,11 +1102,12 @@ func enroll(cfg config) error {
 		)
 	}
 
-	if len(secret) > maxSealedSecretSize {
+	if len(secret) > maxSealedSecretSize-aesGCMOverhead {
 		return fmt.Errorf(
-			"keyring password is %d bytes; TPM sealed data is limited to %d bytes",
+			"keyring password is %d bytes; wrapped TPM sealed data is limited to %d bytes (%d bytes reserved for AES-GCM overhead)",
 			len(secret),
-			maxSealedSecretSize,
+			maxSealedSecretSize-aesGCMOverhead,
+			aesGCMOverhead,
 		)
 	}
 
@@ -1085,6 +1130,32 @@ func enroll(cfg config) error {
 	if err := checkInterrupted(); err != nil {
 		return err
 	}
+
+	wrapKey, err := generateWrapKey()
+	if err != nil {
+		return fmt.Errorf(
+			"generate wrap key: %w",
+			err,
+		)
+	}
+	defer releaseSecretBuf(wrapKey)
+
+	wrapNonce, err := generateWrapNonce()
+	if err != nil {
+		return fmt.Errorf(
+			"generate wrap nonce: %w",
+			err,
+		)
+	}
+
+	wrapped, err := wrapSecret(wrapKey, wrapNonce, secret)
+	if err != nil {
+		return fmt.Errorf(
+			"encrypt keyring password before sealing: %w",
+			err,
+		)
+	}
+	defer zero(wrapped)
 
 	tmp, err := os.MkdirTemp("", appName+"-")
 	if err != nil {
@@ -1166,7 +1237,7 @@ func enroll(cfg config) error {
 	}
 
 	if err := runCmd(
-		bytes.NewReader(secret),
+		bytes.NewReader(wrapped),
 		"tpm2_create",
 		"-C", primaryCtx,
 		"-u", sealedPub,
@@ -1213,10 +1284,19 @@ func enroll(cfg config) error {
 		colorDim,
 	))
 
-	selfTestSecret, err := unsealLoaded(
+	selfTestCipher, err := unsealLoaded(
 		keyCtx,
 		cfg.pcrs,
 	)
+	if err != nil {
+		return fmt.Errorf(
+			"enroll self-test failed: %w",
+			err,
+		)
+	}
+
+	selfTestSecret, err := unwrapSecret(wrapKey, wrapNonce, selfTestCipher)
+	releaseSecretBuf(selfTestCipher)
 	if err != nil {
 		return fmt.Errorf(
 			"enroll self-test failed: %w",
@@ -1246,6 +1326,8 @@ func enroll(cfg config) error {
 		keyCtx,
 		expectedName,
 		secret,
+		wrapKey,
+		wrapNonce,
 	); err != nil {
 		return fmt.Errorf(
 			"persistent enrollment failed: %w",
@@ -1253,10 +1335,15 @@ func enroll(cfg config) error {
 		)
 	}
 
+	wrapKeyHex := hex.EncodeToString(wrapKey)
+	wrapNonceHex := hex.EncodeToString(wrapNonce)
+
 	if err := writeMetadata(
 		cfg,
 		cfg.handle,
 		expectedName,
+		wrapKeyHex,
+		wrapNonceHex,
 	); err != nil {
 		if removeErr := removePersistent(
 			cfg.handle,
@@ -1290,6 +1377,13 @@ func enroll(cfg config) error {
 	fmt.Println(colorize(
 		"note: the policy has no PIN/authValue; any process able to use /dev/tpmrm0 "+
 			"while the PCRs match can unseal the secret (see '"+appName+" doctor')",
+		colorDim,
+	))
+
+	fmt.Println(colorize(
+		"note: metadata.json now also holds the AES-256-GCM key wrapping this secret; "+
+			"deleting every copy makes the sealed ciphertext unrecoverable through this app, "+
+			"though the TPM slot stays occupied until '"+appName+" purge'",
 		colorDim,
 	))
 
@@ -1385,6 +1479,8 @@ func persistSealed(
 	keyCtx string,
 	expectedName string,
 	secret []byte,
+	wrapKey []byte,
+	wrapNonce []byte,
 ) error {
 	if err := validatePersistentHandle(cfg.handle); err != nil {
 		return err
@@ -1457,24 +1553,32 @@ func persistSealed(
 		colorDim,
 	))
 
-	got, err := unsealPersistent(
+	gotCipher, err := unsealPersistent(
 		cfg.handle,
 		cfg.pcrs,
 	)
-
-	if err == nil &&
-		!bytes.Equal(got, secret) {
-		err = errors.New(
-			"unsealed secret mismatch",
-		)
-	}
-
-	releaseSecretBuf(got)
-
 	if err != nil {
 		return rollback(fmt.Errorf(
 			"persistent self-test failed: %w",
 			err,
+		))
+	}
+
+	gotPlain, err := unwrapSecret(wrapKey, wrapNonce, gotCipher)
+	releaseSecretBuf(gotCipher)
+	if err != nil {
+		return rollback(fmt.Errorf(
+			"persistent self-test failed: decrypt: %w",
+			err,
+		))
+	}
+
+	mismatch := !bytes.Equal(gotPlain, secret)
+	releaseSecretBuf(gotPlain)
+
+	if mismatch {
+		return rollback(errors.New(
+			"persistent self-test failed: unsealed secret mismatch",
 		))
 	}
 
@@ -2026,7 +2130,7 @@ func forgetHint() string {
 func purge(cfg config) error {
 	// Security boundary: never read or remove anything through a symlinked
 	// state directory or metadata file.
-	
+
 	if err := checkExistingStatePermissions(cfg); err != nil {
 		return fmt.Errorf(
 			"state permissions: %w",
@@ -2643,6 +2747,10 @@ func printSecurityNotes(cfg config) {
 		"If the keyring password equals your login password, that password is what is sealed.",
 		"Unlock uses gnome-keyring's private, explicitly unsupported D-Bus interface; it may change between versions.",
 		"The secret crosses the session bus in a 'plain' Secret Service session (not encrypted on the bus).",
+		"metadata.json holds the AES-256-GCM key that decrypts the TPM-sealed secret: deleting every copy " +
+			"makes the sealed ciphertext unrecoverable through this app, but the TPM slot stays occupied until 'purge' evicts it. " +
+			"A process able to read metadata.json (same user) can also normally use /dev/tpmrm0, so this key does " +
+			"not protect against the threat above.",
 	}
 
 	if validatePCRSelection(cfg.pcrs) == nil &&
@@ -2739,7 +2847,7 @@ func unsealSecret(
 		)
 	}
 
-	secret, err := unsealPersistent(
+	cipherSecret, err := unsealPersistent(
 		md.Handle,
 		cfg.pcrs,
 	)
@@ -2754,14 +2862,15 @@ func unsealSecret(
 
 	// The Name check above and tpm2_unseal are separate TPM commands. Checking
 	// the Name again afterwards narrows the window in which the object at the
-	// handle could have been swapped in between; a swapped object yields a
-	// secret that would only fail to unlock the keyring, and it is discarded.
+	// handle could have been swapped in between; a swapped object yields
+	// ciphertext that would only fail to decrypt or fail to unlock the
+	// keyring, and it is discarded.
 	after, nameErr := persistentObjectName(
 		md.Handle,
 	)
 
 	if nameErr != nil {
-		releaseSecretBuf(secret)
+		releaseSecretBuf(cipherSecret)
 
 		return nil, fmt.Errorf(
 			"re-verify persistent object Name after unseal: %w",
@@ -2773,7 +2882,7 @@ func unsealSecret(
 		after,
 		md.HandleName,
 	) {
-		releaseSecretBuf(secret)
+		releaseSecretBuf(cipherSecret)
 
 		return nil, fmt.Errorf(
 			"persistent handle %s changed during unseal; discarding the secret",
@@ -2781,7 +2890,37 @@ func unsealSecret(
 		)
 	}
 
-	return secret, nil
+	wrapKey, err := hex.DecodeString(md.WrapKey)
+	if err != nil {
+		releaseSecretBuf(cipherSecret)
+
+		return nil, fmt.Errorf(
+			"metadata has invalid wrap key: %w",
+			err,
+		)
+	}
+	defer zero(wrapKey)
+
+	wrapNonce, err := hex.DecodeString(md.WrapNonce)
+	if err != nil {
+		releaseSecretBuf(cipherSecret)
+
+		return nil, fmt.Errorf(
+			"metadata has invalid wrap nonce: %w",
+			err,
+		)
+	}
+
+	plain, err := unwrapSecret(wrapKey, wrapNonce, cipherSecret)
+	releaseSecretBuf(cipherSecret)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"decrypt unsealed secret failed (metadata.json wrap key may be missing or altered): %w",
+			err,
+		)
+	}
+
+	return plain, nil
 }
 
 // finishUnseal validates the unseal output size and hands out the secret.
@@ -2806,6 +2945,129 @@ func finishUnseal(
 	}
 
 	return out.Bytes(), nil
+}
+
+// ---------------------------------------------------------------------------
+// Secret wrapping (AES-256-GCM)
+// ---------------------------------------------------------------------------
+//
+// The keyring password is never sealed into the TPM in plaintext. It is
+// first encrypted with a random, per-enrollment AES-256-GCM key. Only the
+// resulting ciphertext is sealed/unsealed through the TPM; the key and
+// nonce are stored (hex-encoded) in metadata.json.
+//
+// This does not add protection against the threat model documented at the
+// top of this file (a process that can use /dev/tpmrm0 while the PCRs
+// match): that same process, running as the same user, can normally also
+// read metadata.json. Its purpose is different: deleting every copy of
+// metadata.json removes the wrap key without needing to touch the TPM. The
+// persistent TPM object itself still has to be evicted separately (see
+// "purge") to free the handle.
+
+// generateWrapKey returns a random 32-byte (AES-256) key in a locked
+// buffer. The caller must release it with releaseSecretBuf.
+func generateWrapKey() ([]byte, error) {
+	key := newSecretBuf(wrapKeySize)
+	key = key[:wrapKeySize]
+
+	if _, err := crand.Read(key); err != nil {
+		releaseSecretBuf(key)
+
+		return nil, err
+	}
+
+	return key, nil
+}
+
+// generateWrapNonce returns a random GCM nonce. Unlike the key, the nonce
+// is not secret, so it does not need a locked buffer.
+func generateWrapNonce() ([]byte, error) {
+	nonce := make([]byte, wrapNonceSize)
+
+	if _, err := crand.Read(nonce); err != nil {
+		return nil, err
+	}
+
+	return nonce, nil
+}
+
+func newAEAD(key []byte) (cipher.AEAD, error) {
+	if len(key) != wrapKeySize {
+		return nil, fmt.Errorf(
+			"wrap key is %d bytes, want %d",
+			len(key),
+			wrapKeySize,
+		)
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	return cipher.NewGCM(block)
+}
+
+// wrapSecret encrypts secret with key/nonce. It is only ever called once
+// per enrollment, so nonce reuse across multiple encryptions under the same
+// key never happens.
+func wrapSecret(
+	key,
+	nonce,
+	secret []byte,
+) ([]byte, error) {
+	aead, err := newAEAD(key)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(nonce) != aead.NonceSize() {
+		return nil, fmt.Errorf(
+			"wrap nonce is %d bytes, want %d",
+			len(nonce),
+			aead.NonceSize(),
+		)
+	}
+
+	return aead.Seal(nil, nonce, secret, nil), nil
+}
+
+// unwrapSecret decrypts and authenticates ciphertext with key/nonce. The
+// returned plaintext lives in a locked buffer that the caller must release
+// with releaseSecretBuf. Authentication failure (wrong/missing key, or
+// tampered ciphertext) is reported without detail, matching the "crypto-
+// shredding" intent: once metadata.json is gone, this is expected to fail
+// forever.
+func unwrapSecret(
+	key,
+	nonce,
+	ciphertext []byte,
+) ([]byte, error) {
+	aead, err := newAEAD(key)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(nonce) != aead.NonceSize() {
+		return nil, fmt.Errorf(
+			"wrap nonce is %d bytes, want %d",
+			len(nonce),
+			aead.NonceSize(),
+		)
+	}
+
+	backing := newSecretBuf(maxSealedSecretSize)
+
+	plain, err := aead.Open(backing[:0], nonce, ciphertext, nil)
+	if err != nil {
+		releaseSecretBuf(backing)
+
+		return nil, errors.New(
+			"authentication failed: wrap key/nonce do not match the sealed data",
+		)
+	}
+
+	return plain, nil
 }
 
 func unsealPersistent(
@@ -3341,7 +3603,9 @@ func rejectSymlinkComponents(path string) error {
 func writeMetadata(
 	cfg config,
 	handle,
-	handleName string,
+	handleName,
+	wrapKeyHex,
+	wrapNonceHex string,
 ) error {
 	if err := validatePersistentHandle(handle); err != nil {
 		return err
@@ -3350,6 +3614,20 @@ func writeMetadata(
 	if err := validateTPMName(handleName); err != nil {
 		return fmt.Errorf(
 			"invalid TPM object Name: %w",
+			err,
+		)
+	}
+
+	if err := validateWrapKey(wrapKeyHex); err != nil {
+		return fmt.Errorf(
+			"invalid wrap key: %w",
+			err,
+		)
+	}
+
+	if err := validateWrapNonce(wrapNonceHex); err != nil {
+		return fmt.Errorf(
+			"invalid wrap nonce: %w",
 			err,
 		)
 	}
@@ -3376,6 +3654,8 @@ func writeMetadata(
 		PCRs:       cfg.pcrs,
 		Handle:     handle,
 		HandleName: handleName,
+		WrapKey:    wrapKeyHex,
+		WrapNonce:  wrapNonceHex,
 	}
 
 	if err := validateMetadata(md); err != nil {
@@ -3630,6 +3910,20 @@ func validateMetadata(md metadata) error {
 	if err := validateTPMName(md.HandleName); err != nil {
 		return fmt.Errorf(
 			"metadata has invalid persistent TPM Name: %w",
+			err,
+		)
+	}
+
+	if err := validateWrapKey(md.WrapKey); err != nil {
+		return fmt.Errorf(
+			"metadata has invalid wrap key: %w",
+			err,
+		)
+	}
+
+	if err := validateWrapNonce(md.WrapNonce); err != nil {
+		return fmt.Errorf(
+			"metadata has invalid wrap nonce: %w",
 			err,
 		)
 	}
@@ -3902,6 +4196,50 @@ func validateTPMName(name string) error {
 			nameAlg,
 			digestSize,
 			len(raw[2:]),
+		)
+	}
+
+	return nil
+}
+
+// validateWrapKey validates the hex-encoded AES-256-GCM wrap key stored in
+// metadata.json.
+func validateWrapKey(hexKey string) error {
+	raw, err := hex.DecodeString(hexKey)
+	if err != nil {
+		return fmt.Errorf(
+			"wrap key is not valid hexadecimal: %w",
+			err,
+		)
+	}
+
+	if len(raw) != wrapKeySize {
+		return fmt.Errorf(
+			"wrap key is %d bytes, want %d",
+			len(raw),
+			wrapKeySize,
+		)
+	}
+
+	return nil
+}
+
+// validateWrapNonce validates the hex-encoded AES-GCM nonce stored in
+// metadata.json.
+func validateWrapNonce(hexNonce string) error {
+	raw, err := hex.DecodeString(hexNonce)
+	if err != nil {
+		return fmt.Errorf(
+			"wrap nonce is not valid hexadecimal: %w",
+			err,
+		)
+	}
+
+	if len(raw) != wrapNonceSize {
+		return fmt.Errorf(
+			"wrap nonce is %d bytes, want %d",
+			len(raw),
+			wrapNonceSize,
 		)
 	}
 

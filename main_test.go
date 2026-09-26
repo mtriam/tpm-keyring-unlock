@@ -437,6 +437,8 @@ func TestValidateMetadata(t *testing.T) {
 		PCRs:       "sha256:7",
 		Handle:     "0x81018043",
 		HandleName: "000b00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+		WrapKey:    strings.Repeat("ab", wrapKeySize),
+		WrapNonce:  strings.Repeat("cd", wrapNonceSize),
 	}
 
 	if err := validateMetadata(valid); err != nil {
@@ -498,6 +500,42 @@ func TestValidateMetadata(t *testing.T) {
 				md.HandleName = "not-hex"
 			},
 		},
+		{
+			name: "missing wrap key",
+			change: func(md *metadata) {
+				md.WrapKey = ""
+			},
+		},
+		{
+			name: "wrap key wrong length",
+			change: func(md *metadata) {
+				md.WrapKey = strings.Repeat("ab", wrapKeySize-1)
+			},
+		},
+		{
+			name: "wrap key not hex",
+			change: func(md *metadata) {
+				md.WrapKey = strings.Repeat("zz", wrapKeySize)
+			},
+		},
+		{
+			name: "missing wrap nonce",
+			change: func(md *metadata) {
+				md.WrapNonce = ""
+			},
+		},
+		{
+			name: "wrap nonce wrong length",
+			change: func(md *metadata) {
+				md.WrapNonce = strings.Repeat("cd", wrapNonceSize-1)
+			},
+		},
+		{
+			name: "wrap nonce not hex",
+			change: func(md *metadata) {
+				md.WrapNonce = strings.Repeat("zz", wrapNonceSize)
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -512,6 +550,195 @@ func TestValidateMetadata(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestValidateWrapKey(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{
+			name:  "valid",
+			value: strings.Repeat("ab", wrapKeySize),
+			want:  true,
+		},
+		{
+			name:  "empty",
+			value: "",
+			want:  false,
+		},
+		{
+			name:  "too short",
+			value: strings.Repeat("ab", wrapKeySize-1),
+			want:  false,
+		},
+		{
+			name:  "too long",
+			value: strings.Repeat("ab", wrapKeySize+1),
+			want:  false,
+		},
+		{
+			name:  "not hex",
+			value: strings.Repeat("zz", wrapKeySize),
+			want:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateWrapKey(tt.value)
+
+			if (err == nil) != tt.want {
+				t.Fatalf(
+					"validateWrapKey(%q) error = %v, wantValid=%v",
+					tt.value,
+					err,
+					tt.want,
+				)
+			}
+		})
+	}
+}
+
+func TestValidateWrapNonce(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{
+			name:  "valid",
+			value: strings.Repeat("cd", wrapNonceSize),
+			want:  true,
+		},
+		{
+			name:  "empty",
+			value: "",
+			want:  false,
+		},
+		{
+			name:  "too short",
+			value: strings.Repeat("cd", wrapNonceSize-1),
+			want:  false,
+		},
+		{
+			name:  "too long",
+			value: strings.Repeat("cd", wrapNonceSize+1),
+			want:  false,
+		},
+		{
+			name:  "not hex",
+			value: strings.Repeat("zz", wrapNonceSize),
+			want:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateWrapNonce(tt.value)
+
+			if (err == nil) != tt.want {
+				t.Fatalf(
+					"validateWrapNonce(%q) error = %v, wantValid=%v",
+					tt.value,
+					err,
+					tt.want,
+				)
+			}
+		})
+	}
+}
+
+func TestWrapUnwrapSecretRoundTrip(t *testing.T) {
+	key, err := generateWrapKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseSecretBuf(key)
+
+	nonce, err := generateWrapNonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secret := []byte("correct horse battery staple")
+
+	ciphertext, err := wrapSecret(key, nonce, secret)
+	if err != nil {
+		t.Fatalf("wrapSecret returned error: %v", err)
+	}
+
+	if len(ciphertext) != len(secret)+aesGCMOverhead {
+		t.Fatalf(
+			"ciphertext length = %d, want %d",
+			len(ciphertext),
+			len(secret)+aesGCMOverhead,
+		)
+	}
+
+	plain, err := unwrapSecret(key, nonce, ciphertext)
+	if err != nil {
+		t.Fatalf("unwrapSecret returned error: %v", err)
+	}
+	defer releaseSecretBuf(plain)
+
+	if string(plain) != string(secret) {
+		t.Fatalf("unwrapSecret() = %q, want %q", plain, secret)
+	}
+}
+
+func TestUnwrapSecretFailsWithWrongKey(t *testing.T) {
+	key, err := generateWrapKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseSecretBuf(key)
+
+	nonce, err := generateWrapNonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ciphertext, err := wrapSecret(key, nonce, []byte("secret value"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wrongKey, err := generateWrapKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseSecretBuf(wrongKey)
+
+	if _, err := unwrapSecret(wrongKey, nonce, ciphertext); err == nil {
+		t.Fatal("unwrapSecret succeeded with the wrong key")
+	}
+}
+
+func TestUnwrapSecretFailsWithTamperedCiphertext(t *testing.T) {
+	key, err := generateWrapKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseSecretBuf(key)
+
+	nonce, err := generateWrapNonce()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ciphertext, err := wrapSecret(key, nonce, []byte("secret value"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tampered := append([]byte(nil), ciphertext...)
+	tampered[0] ^= 0xff
+
+	if _, err := unwrapSecret(key, nonce, tampered); err == nil {
+		t.Fatal("unwrapSecret succeeded with tampered ciphertext")
 	}
 }
 
